@@ -1,0 +1,17 @@
+(library
+ (public_name type_state.type_state)
+ (name type_state)
+ (modules type_state)
+ (libraries binsec.sse))
+
+(library
+ (public_name type_state.registration)
+ (name registration)
+ (modules registration)
+ (libraries binsec.cli.sse type_state.type_state))
+
+(plugin
+ (name type_state)
+ (libraries type_state.registration)
+ (site
+  (binsec plugins)))
