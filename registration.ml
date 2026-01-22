@@ -1,6 +1,6 @@
 module Namespace = Binsec_cli.Cli.Make (struct
   let name="Type State"
-  let shortname="type_state"
+  let shortname="type-state"
 end)
 
 let () =
