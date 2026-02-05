@@ -68,12 +68,12 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
   let turn_on_ok_broken = nev off_ok "turn_on" on_broken in
   let turn_off_ok = nev on_ok "turn_off" off_ok in
   let turn_off_broken = nev on_broken "turn_off" off_broken in
-  let is_broken_on_ok =
-    ne on_ok ("is_broken", vrai, Dba.Expr.equal rax faux) on_ok
+  let is_dead_on_ok =
+    ne on_ok ("is_dead", vrai, Dba.Expr.equal rax faux) on_ok
   in
   (* TODO impossible transitions *)
-  let is_broken_on_broken =
-    ne on_broken ("is_broken", vrai, Dba.Expr.equal rax vrai) on_broken
+  let is_dead_on_broken =
+    ne on_broken ("is_dead", vrai, Dba.Expr.equal rax vrai) on_broken
   in
   (* automaton *)
   let av = Automaton.A.add_vertex lb_automaton in
@@ -91,8 +91,8 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
       turn_on_ok_broken;
       turn_off_ok;
       turn_off_broken;
-      is_broken_on_ok;
-      is_broken_on_broken;
+      is_dead_on_ok;
+      is_dead_on_broken;
     ]
 
 module Make (Engine : ENGINE) : EXTENSIONS with type path = Engine.Path.t =
@@ -101,10 +101,17 @@ struct
   open Binsec_kernel
   module Path = Engine.Path
 
+  module ZtMap = Map.Make (struct
+    type t = Z.t
+
+    let compare = Z.compare
+  end)
+
   type path = Path.t
   type Ir.builtin += TS_call of Virtual_address.t | TS_return
 
   let function_intervals = ref Zmap.empty
+  let function_addresses : string ZtMap.t ref = ref @@ ZtMap.empty
 
   let make_function_intervals
       (symlist : (string * Z.t * Z.t) (* name, addr, size *) list) : unit =
@@ -112,6 +119,13 @@ struct
       (fun (s, z, z') ->
         let sgt = Zmap.singleton ~lo:z ~hi:(Z.add z z') s in
         function_intervals := Zmap.union_left !function_intervals sgt)
+      symlist
+
+  let make_function_addresses
+      (symlist : (string * Z.t * Z.t) (* name, addr, size *) list) : unit =
+    List.iter
+      (fun (s, z, _) ->
+        function_addresses := ZtMap.add z s @@ !function_addresses)
       symlist
 
   (*
@@ -167,9 +181,7 @@ struct
                     @@ Path.eval path
                          (env.lookup_symbol e_name Dba.Var.Tag.Value)
                   with _ ->
-                    TSLogger.debug ~level:1
-                      "Warning : Le symbole n'existe pas : %s" e_name;
-                    (*TODO warning quand le symbole n'existe pas ?*)
+                    TSLogger.warning "Le symbole n'existe pas : %s" e_name;
                     Bitvector.value_of @@ Bitvector.zero
                 in
                 let size =
@@ -178,25 +190,15 @@ struct
                     @@ Path.eval path
                          (env.lookup_symbol e_name Dba.Var.Tag.Size)
                   with _ ->
-                    (*TODO warning quand le symbole n'a pas de taille ?*)
-                    TSLogger.debug ~level:1
-                      "Warning : Le symbole %s n'a pas de taille" e_name;
+                    TSLogger.warning "Le symbole %s n'a pas de taille" e_name;
                     Bitvector.value_of @@ Bitvector.zero
                 in
                 (e_name, addr, size) :: l)
               lb_automaton []
           in
           make_function_intervals symbol_assoc_list;
+          make_function_addresses symbol_assoc_list;
           true);
-      (* Utiliser fetch hook pour pouvoir directement instrumenter l'adresse
-             sse/loader/ir.mli:132
-             stmt list : [Opcode (Builtin TS_call)]
-
-         garder le instrumentation routine pour les return.
-         l'adresse à laquelle on est est dans label : Ir.label
-           (soit une instruction assembleur -> Instruction.address
-            soit un hook (qui contient l'adresse))
-      *)
       Fetch_hook
         {
           scope = None;
@@ -204,30 +206,41 @@ struct
           callback =
             (fun va ->
               match
-                Zmap.find_opt (Virtual_address.to_bigint va)
-                @@ !function_intervals
+                ZtMap.find_opt (Virtual_address.to_bigint va)
+                @@ !function_addresses
               with
-              | Item { elt; _ } ->
-                  Format.fprintf Format.std_formatter
-                    "Inserting call hook for %s" elt;
+              | Some elt ->
+                  TSLogger.debug ~level:1 "Inserting call hook for %s" elt;
                   Option.some
                   @@ Ir.Graph.of_script va
                        (String.cat "Hook_call_" elt)
                        [ Opcode (Builtin (TS_call va)) ]
-              | Empty -> None);
+              | None -> None);
         };
       Instrumentation_routine
         (fun graph ->
           Revision.iter_new_vertex
             (fun vertex ->
               let node = Revision.node graph vertex in
-              let _ = Ir.label_of node in
               match node with
               (* Insert TS_return builtin *)
-              | Terminator { kind = Goto { target = _; tag = Return; _ }; _ } ->
-                  Revision.insert_before graph vertex (Builtin TS_return)
-              | Terminator { kind = Jump { target = _; tag = Return; _ }; _ } ->
-                  Revision.insert_before graph vertex (Builtin TS_return)
+              | Terminator { kind = Goto { target = _; tag = Return; _ }; _ }
+              | Terminator { kind = Jump { target = _; tag = Return; _ }; _ }
+                -> (
+                  let label = Ir.label_of node in
+                  let addr =
+                    match label with
+                    | Instruction i -> Instruction.address i
+                    | Hook { addr; _ } -> addr
+                  in
+                  match
+                    Zmap.find_opt (Virtual_address.to_bigint addr)
+                    @@ !function_intervals
+                  with
+                  | Item { elt; _ } ->
+                      TSLogger.debug ~level:1 "Inserting return hook for %s" elt;
+                      Revision.insert_before graph vertex (Builtin TS_return)
+                  | Empty -> ())
               | _ -> ())
             graph);
       Builtin_printer
