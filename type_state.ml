@@ -2,12 +2,18 @@ module ID = struct
   let name = "type_state"
 end
 
+module TSLogger = Binsec_sse.Logger.Sub (struct
+  let name = "type_state"
+end)
+
+type Binsec_sse.Script.Ast.t += Def_automaton
+
 open Binsec_sse.Types
 
 module Automaton = struct
   open Binsec_kernel
 
-  module Vertex : Graph.Sig.COMPARABLE = struct
+  module Vertex : Graph.Sig.COMPARABLE with type t = string = struct
     type t = string
 
     let compare = String.compare
@@ -36,8 +42,58 @@ module Automaton = struct
   end
 end
 
-let lb_automaton = ref @@ Automaton.A.create ()
-let make_lb_automaton (_ : unit) = ()
+let lb_automaton = Automaton.A.create ()
+
+let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
+  let open Binsec_kernel in
+  let module MyIsaHelper = (val Isa_helper.get arch) in
+  let vrai = Dba.Expr.constant @@ Bitvector.one in
+  let faux = Dba.Expr.constant @@ Bitvector.zero in
+  let rax = MyIsaHelper.get_return_address () in
+  (* Vertexes *)
+  let nv = Automaton.A.V.create in
+  let bottom = nv "bottom" in
+  let off_ok = nv "off ok" in
+  let off_broken = nv "off broken" in
+  let on_ok = nv "on ok" in
+  let on_broken = nv "on broken" in
+  let impossible_state = nv "Impossible state" in
+  (* Edges *)
+  let ne = Automaton.A.E.create in
+  let nev e s e' = Automaton.A.E.create e (s, vrai, vrai) e' in
+  let buy = nev bottom "buy" off_ok in
+  let recycle_ok = nev off_ok "recycle" bottom in
+  let recycle_broken = nev off_broken "recycle" bottom in
+  let turn_on_ok_ok = nev off_ok "turn_on" on_ok in
+  let turn_on_ok_broken = nev off_ok "turn_on" on_broken in
+  let turn_off_ok = nev on_ok "turn_off" off_ok in
+  let turn_off_broken = nev on_broken "turn_off" off_broken in
+  let is_broken_on_ok =
+    ne on_ok ("is_broken", vrai, Dba.Expr.equal rax faux) on_ok
+  in
+  (* TODO impossible transitions *)
+  let is_broken_on_broken =
+    ne on_broken ("is_broken", vrai, Dba.Expr.equal rax vrai) on_broken
+  in
+  (* automaton *)
+  let av = Automaton.A.add_vertex lb_automaton in
+  let ae = Automaton.A.add_edge_e lb_automaton in
+  List.iter
+    (fun v -> av v)
+    [ bottom; off_ok; off_broken; on_ok; on_broken; impossible_state ];
+  List.iter
+    (fun e -> ae e)
+    [
+      buy;
+      recycle_ok;
+      recycle_broken;
+      turn_on_ok_ok;
+      turn_on_ok_broken;
+      turn_off_ok;
+      turn_off_broken;
+      is_broken_on_ok;
+      is_broken_on_broken;
+    ]
 
 module Make (Engine : ENGINE) : EXTENSIONS with type path = Engine.Path.t =
 struct
@@ -48,18 +104,15 @@ struct
   type path = Path.t
   type Ir.builtin += TS_call of Virtual_address.t | TS_return
 
-  (*
-  Utiliser -> Binsec_base.Zmap !!
-  
-  module Zmap = Map.Make
-    (struct
-      type t = string
-      let compare = String.compare
-    end)
-*)
+  let function_intervals = ref Zmap.empty
 
-  let zmap : Z.t Interval.t Zmap.t ref = ref Zmap.empty
-  let make_zmap (_ : (string * Z.t) list) : unit = ()
+  let make_function_intervals
+      (symlist : (string * Z.t * Z.t) (* name, addr, size *) list) : unit =
+    List.iter
+      (fun (s, z, z') ->
+        let sgt = Zmap.singleton ~lo:z ~hi:(Z.add z z') s in
+        function_intervals := Zmap.union_left !function_intervals sgt)
+      symlist
 
   (*
      le call :
@@ -77,10 +130,33 @@ struct
   let call _ (_ : Path.t) = Return
   let return (_ : Path.t) = Return
 
+  let initialization_callback (_ : Path.t) =
+    TSLogger.debug ~level:1 "Initialization_callback";
+    make_lb_automaton Engine.isa
+
+  let grammar_extension =
+    [
+      Dyp.Add_rules
+        [
+          ( ( "decl",
+              [
+                Dyp.Regexp (RE_String "def"); Dyp.Regexp (RE_String "automaton");
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ _; _ ] -> (Binsec_script.Syntax.Decl Def_automaton, [])
+              | _ -> assert false );
+        ];
+    ]
+
   let list =
     [
+      Initialization_callback initialization_callback;
+      Grammar_extension grammar_extension;
       Command_handler
         (fun _ (env : Script.env) path : bool ->
+          TSLogger.debug ~level:1 "Command_handler";
           let symbol_assoc_list =
             Automaton.A.fold_edges_e
               (fun e l ->
@@ -90,12 +166,27 @@ struct
                     Bitvector.value_of
                     @@ Path.eval path
                          (env.lookup_symbol e_name Dba.Var.Tag.Value)
-                  with _ -> Bitvector.value_of @@ Bitvector.zero
+                  with _ ->
+                    TSLogger.debug ~level:1
+                      "Warning : Le symbole n'existe pas : %s" e_name;
+                    (*TODO warning quand le symbole n'existe pas ?*)
+                    Bitvector.value_of @@ Bitvector.zero
                 in
-                (e_name, addr) :: l)
-              !lb_automaton []
+                let size =
+                  try
+                    Bitvector.value_of
+                    @@ Path.eval path
+                         (env.lookup_symbol e_name Dba.Var.Tag.Size)
+                  with _ ->
+                    (*TODO warning quand le symbole n'a pas de taille ?*)
+                    TSLogger.debug ~level:1
+                      "Warning : Le symbole %s n'a pas de taille" e_name;
+                    Bitvector.value_of @@ Bitvector.zero
+                in
+                (e_name, addr, size) :: l)
+              lb_automaton []
           in
-          make_zmap symbol_assoc_list;
+          make_function_intervals symbol_assoc_list;
           true);
       (* Utiliser fetch hook pour pouvoir directement instrumenter l'adresse
              sse/loader/ir.mli:132
@@ -106,17 +197,32 @@ struct
            (soit une instruction assembleur -> Instruction.address
             soit un hook (qui contient l'adresse))
       *)
+      Fetch_hook
+        {
+          scope = None;
+          stage = Early;
+          callback =
+            (fun va ->
+              match
+                Zmap.find_opt (Virtual_address.to_bigint va)
+                @@ !function_intervals
+              with
+              | Item { elt; _ } ->
+                  Format.fprintf Format.std_formatter
+                    "Inserting call hook for %s" elt;
+                  Option.some
+                  @@ Ir.Graph.of_script va
+                       (String.cat "Hook_call_" elt)
+                       [ Opcode (Builtin (TS_call va)) ]
+              | Empty -> None);
+        };
       Instrumentation_routine
         (fun graph ->
           Revision.iter_new_vertex
             (fun vertex ->
-              match Revision.node graph vertex with
-              (* Insert TS_call builtin *)
-              (* On veut instrumenter l'adresse de la fonction pas l'adresse du call *)
-              | Fallthrough { kind = Goto { tag = Call { base; _ }; _ }; _ }
-              | Terminator { kind = Goto { tag = Call { base; _ }; _ }; _ }
-              | Terminator { kind = Jump { tag = Call { base; _ }; _ }; _ } ->
-                  Revision.insert_before graph vertex (Builtin (TS_call base))
+              let node = Revision.node graph vertex in
+              let _ = Ir.label_of node in
+              match node with
               (* Insert TS_return builtin *)
               | Terminator { kind = Goto { target = _; tag = Return; _ }; _ } ->
                   Revision.insert_before graph vertex (Builtin TS_return)
@@ -145,9 +251,6 @@ module Plugin : PLUGIN = struct
   include ID
 
   let fields : (module PATH) -> field list = fun _ -> []
-
-  (* TODO mettre dans initial callback *)
-  let _ = make_lb_automaton ()
 
   let extensions :
       type a. (module ENGINE with type Path.t = a) -> a extension list =
