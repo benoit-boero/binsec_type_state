@@ -1,3 +1,5 @@
+open Binsec_sse.Types
+
 module ID = struct
   let name = "type_state"
 end
@@ -6,13 +8,10 @@ module TSLogger = Binsec_sse.Logger.Sub (struct
   let name = "type_state"
 end)
 
-type Binsec_sse.Script.Ast.t += Def_automaton
-
-open Binsec_sse.Types
-
 module Automaton = struct
   open Binsec_kernel
 
+  (* TODO variant Ok of string et Error of string *)
   module Vertex : Graph.Sig.COMPARABLE with type t = string = struct
     type t = string
 
@@ -41,6 +40,19 @@ module Automaton = struct
     end
   end
 end
+
+type Binsec_sse.Script.Ast.t += Def_automaton
+
+type ('value, 'model, 'state, 'path, 'a) field_id +=
+  | TS_call_stack :
+      ('value, 'model, 'state, 'path, Automaton.A.E.t list list) field_id
+    (*TODO
+
+          'value -> 'value Bitvector.Map.t String.Map.t -> 'value Value.Map.t String.Map.t
+
+        - Le Value.Map.add renvoit l'information sur si il faut forker ou pas et comment.
+    *)
+  | TS_state : ('value, 'model, 'state, 'path, 'value) field_id
 
 let lb_automaton = Automaton.A.create ()
 
@@ -72,7 +84,7 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
     ne on_ok ("is_dead", vrai, Dba.Expr.equal rax faux) on_ok
   in
   (* TODO impossible transitions *)
-  let is_dead_on_broken =
+  let is_dead_or_broken =
     ne on_broken ("is_dead", vrai, Dba.Expr.equal rax vrai) on_broken
   in
   (* automaton *)
@@ -92,8 +104,16 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
       turn_off_ok;
       turn_off_broken;
       is_dead_on_ok;
-      is_dead_on_broken;
+      is_dead_or_broken;
     ]
+(* TODO
+   Impossible state pas nécessaire.
+   On le déduit du fait que les transitions d'un état donné,
+   pour une étiquette données, doivent couvrir l'univers.
+   Donc toutes les transitions qui sont dans le complémentaires des états valides sont impossibles.
+   Si pas de transition de cette étiquette alors état erreur.
+   L'utilisateur spécifie les états valides et possibles.
+*)
 
 module Make (Engine : ENGINE) : EXTENSIONS with type path = Engine.Path.t =
 struct
@@ -106,6 +126,11 @@ struct
 
     let compare = Z.compare
   end)
+
+  (* TODO
+        grace à ça on peut faire Path.get path ts_state_key / Path.set path ts_state_key
+     let ts_state_key = Engine.lookup TS_state
+  *)
 
   type path = Path.t
   type Ir.builtin += TS_call of Virtual_address.t | TS_return
@@ -263,7 +288,13 @@ end
 module Plugin : PLUGIN = struct
   include ID
 
-  let fields : (module PATH) -> field list = fun _ -> []
+  let fields : (module PATH) -> field list =
+   fun _ ->
+    [
+      (* TODO issue: on peut typer default un peu comme on veut *)
+      Field { id = TS_state; default = []; copy = None; merge = None };
+      Field { id = TS_call_stack; default = []; copy = None; merge = None };
+    ]
 
   let extensions :
       type a. (module ENGINE with type Path.t = a) -> a extension list =
