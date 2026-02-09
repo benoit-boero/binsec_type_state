@@ -5,19 +5,23 @@ module ID = struct
 end
 
 module TSLogger = Binsec_sse.Logger.Sub (struct
-  let name = "type_state"
+  let name = "type-state"
 end)
 
 module Automaton = struct
   open Binsec_kernel
 
-  (* TODO variant Ok of string et Error of string *)
-  module Vertex : Graph.Sig.COMPARABLE with type t = string = struct
-    type t = string
+  type state_label = Ok of string | Error of string | Bottom
 
-    let compare = String.compare
-    let hash = Hashtbl.hash
-    let equal = String.equal
+  (** string_of_state_label *)
+  let sosl sl = match sl with Ok s | Error s -> s | Bottom -> ""
+
+  module Vertex : Graph.Sig.COMPARABLE with type t = state_label = struct
+    type t = state_label
+
+    let compare t t' = String.compare (sosl t) (sosl t')
+    let hash t = Hashtbl.hash (sosl t)
+    let equal t t' = String.equal (sosl t) (sosl t')
   end
 
   module Edge :
@@ -47,9 +51,7 @@ type ('value, 'model, 'state, 'path, 'a) field_id +=
   | TS_call_stack :
       ('value, 'model, 'state, 'path, Automaton.A.E.t list list) field_id
     (*TODO
-
           'value -> 'value Bitvector.Map.t String.Map.t -> 'value Value.Map.t String.Map.t
-
         - Le Value.Map.add renvoit l'information sur si il faut forker ou pas et comment.
     *)
   | TS_state : ('value, 'model, 'state, 'path, 'value) field_id
@@ -64,12 +66,12 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
   let rax = MyIsaHelper.get_return_address () in
   (* Vertexes *)
   let nv = Automaton.A.V.create in
-  let bottom = nv "bottom" in
-  let off_ok = nv "off ok" in
-  let off_broken = nv "off broken" in
-  let on_ok = nv "on ok" in
-  let on_broken = nv "on broken" in
-  let impossible_state = nv "Impossible state" in
+  let bottom = nv Bottom in
+  let off_ok = nv @@ Ok "off ok" in
+  let off_broken = nv @@ Ok "off broken" in
+  let on_ok = nv @@ Ok "on ok" in
+  let on_broken = nv @@ Ok "on broken" in
+  let impossible_state = nv @@ Ok "Impossible state" in
   (* Edges *)
   let ne = Automaton.A.E.create in
   let nev e s e' = Automaton.A.E.create e (s, vrai, vrai) e' in
@@ -83,7 +85,6 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
   let is_dead_on_ok =
     ne on_ok ("is_dead", vrai, Dba.Expr.equal rax faux) on_ok
   in
-  (* TODO impossible transitions *)
   let is_dead_or_broken =
     ne on_broken ("is_dead", vrai, Dba.Expr.equal rax vrai) on_broken
   in
@@ -291,7 +292,6 @@ module Plugin : PLUGIN = struct
   let fields : (module PATH) -> field list =
    fun _ ->
     [
-      (* TODO issue: on peut typer default un peu comme on veut *)
       Field { id = TS_state; default = []; copy = None; merge = None };
       Field { id = TS_call_stack; default = []; copy = None; merge = None };
     ]
@@ -300,5 +300,6 @@ module Plugin : PLUGIN = struct
       type a. (module ENGINE with type Path.t = a) -> a extension list =
    fun engine ->
     let module Extensions = Make ((val engine)) in
+    TSLogger.info "Type state activated.";
     Extensions.list
 end
