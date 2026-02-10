@@ -2,7 +2,7 @@
  (public_name type_state.type_state)
  (name type_state)
  (modules type_state)
- (libraries binsec.sse))
+ (libraries binsec.sse binsec.sse.stake))
 
 (library
  (public_name type_state.registration)
