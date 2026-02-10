@@ -11,10 +11,20 @@ end)
 module Automaton = struct
   open Binsec_kernel
 
-  type state_label = Ok of string | Error of string | Bottom
+  type state_label =
+    | Ok of string
+    | Error of string
+    | Bottom
+    | ErrorDefault
+    | Impossible
 
   (** string_of_state_label *)
-  let sosl sl = match sl with Ok s | Error s -> s | Bottom -> ""
+  let sosl sl =
+    match sl with
+    | Ok s | Error s -> s
+    | Bottom -> "Bottom"
+    | ErrorDefault -> "ErrorDefault"
+    | Impossible -> "Impossible"
 
   module Vertex : Graph.Sig.COMPARABLE with type t = state_label = struct
     type t = state_label
@@ -40,7 +50,86 @@ module Automaton = struct
     include Graph.Imperative.Digraph.ConcreteLabeled (Vertex) (Edge)
 
     module Utils = struct
+      let pp_vertex ppf vertex = Format.fprintf ppf "%s" @@ sosl vertex
+
+      let pp_edge ppf edge =
+        let v, lbl, v' = edge in
+        let e_name, expr, expr' = lbl in
+        Format.fprintf ppf
+          "@[<v>(%a) -- %s --> (%a)@   * Call Cond: %a@   * Return Cond: %a@]"
+          pp_vertex v e_name pp_vertex v' Binsec_sse_stake.pp_dba expr
+          Binsec_sse_stake.pp_dba expr'
+
+      (*
+        For each state v:
+          - we fetch the list of transition.
+          - for each functions that appears we add the impossible transitions
+            * If the complementary of the union of predicates is non empty we add that.
+          - we add the error transition for each function that is not present.
+      *)
+      let add_impossible_and_error_states t : unit =
+        let default_error_state = V.create ErrorDefault in
+        let rec sorted_list_uniq_insert (l : string list) (s : string) :
+            string list =
+          match l with
+          | [] -> [ s ]
+          | t :: q when String.compare t s < 0 -> s :: t :: q
+          | t :: q when String.compare t s = 0 -> t :: q
+          | t :: q -> t :: sorted_list_uniq_insert q s
+        in
+        let functions =
+          fold_edges_e
+            (fun (e : E.t) acc ->
+              let name, _, _ = E.label e in
+              sorted_list_uniq_insert acc name)
+            t []
+        in
+        TSLogger.debug ~level:2 "@[<v>List of all functions:@ %a@]"
+          (Format.pp_print_list Format.pp_print_string)
+          functions;
+        let rec sorted_list_uniq_diff l l' =
+          match l' with
+          | [] -> l
+          | t' :: q' -> (
+              match l with
+              | [] -> []
+              | t :: q when String.compare t' t < 0 ->
+                  t :: sorted_list_uniq_diff q q'
+              | t :: q when String.equal t' t -> sorted_list_uniq_diff q q'
+              | t :: q -> t :: sorted_list_uniq_diff q l')
+        in
+        let to_iter_v (v : V.t) =
+          let edge_list =
+            succ_e t v
+            |> List.map (fun e ->
+                   let n, _, _ = E.label e in
+                   n)
+          in
+          let flist = edge_list |> List.fold_left sorted_list_uniq_insert [] in
+          let eflist = sorted_list_uniq_diff functions flist in
+          eflist
+          |> List.iter (fun name ->
+                 let vrai = Dba.Expr.constant Bitvector.one in
+                 let label = (name, vrai, vrai) in
+                 let edge = E.create v label default_error_state in
+                 TSLogger.debug ~level:3 "@[<v>Completing automaton with:@ %a@]"
+                   pp_edge edge;
+                 add_edge_e t edge)
+        in
+        t |> iter_vertex to_iter_v
+
       let get_edge_name (e : E.t) = match E.label e with n, _, _ -> n
+
+      let find_edges_by_name (n : string) t =
+        fold_edges_e
+          (fun edge acc ->
+            let edge_name, _, _ = E.label edge in
+            if String.equal n edge_name then edge :: acc else acc)
+          t []
+
+      let is_constructor (e : E.t) =
+        let v, _, _ = e in
+        v = Bottom
     end
   end
 end
@@ -63,7 +152,7 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
   let module MyIsaHelper = (val Isa_helper.get arch) in
   let vrai = Dba.Expr.constant @@ Bitvector.one in
   let faux = Dba.Expr.constant @@ Bitvector.zero in
-  let rax = MyIsaHelper.get_return_address () in
+  let rax = Dba.LValue.to_expr @@ MyIsaHelper.get_ret () in
   (* Vertexes *)
   let nv = Automaton.A.V.create in
   let bottom = nv Bottom in
@@ -130,11 +219,24 @@ struct
 
   (* TODO
         grace à ça on peut faire Path.get path ts_state_key / Path.set path ts_state_key
-     let ts_state_key = Engine.lookup TS_state
   *)
+  let ts_call_stack_key = Engine.lookup TS_call_stack
+  let ts_state_key = Engine.lookup TS_state
+
+  let push (path : Path.t) (x : Automaton.A.E.t list) =
+    let curr = Path.get path ts_call_stack_key in
+    Path.set path ts_call_stack_key (x :: curr)
+
+  let pop (path : Path.t) =
+    let curr = Path.get path ts_call_stack_key in
+    match curr with
+    | t :: q ->
+        Path.set path ts_call_stack_key q;
+        t
+    | [] -> TSLogger.fatal "Popped from empty stack."
 
   type path = Path.t
-  type Ir.builtin += TS_call of Virtual_address.t | TS_return
+  type Ir.builtin += TS_call of string | TS_return of string
 
   let function_intervals = ref Zmap.empty
   let function_addresses : string ZtMap.t ref = ref @@ ZtMap.empty
@@ -167,12 +269,52 @@ struct
        - Call stack pour stocker les listes de transition.
        - Un champ state : Path.value (Symbolic.Default.Expr.t probablement)
   *)
-  let call _ (_ : Path.t) = Return
-  let return (_ : Path.t) = Return
+  let call (name : string) (path : Path.t) =
+    let unfiltered_edge_list =
+      Automaton.A.Utils.find_edges_by_name name lb_automaton
+    in
+    let edge_list =
+      List.filter
+        (fun e ->
+          let lbl = Automaton.A.E.label e in
+          let _, pred, _ = lbl in
+          (* TODO est-ce que is_zero = Unknown => un possible ? *)
+          match Path.is_zero path pred with
+          | Unknown ->
+              TSLogger.warning
+                "Solver returned unknown while filtering edge at call site.";
+              true
+          | True -> false
+          | False -> true)
+        unfiltered_edge_list
+    in
+    TSLogger.debug ~level:2 "%s called" name;
+    TSLogger.debug ~level:2 "@[<v>Filtered at call:@ %a@]"
+      (Format.pp_print_list Automaton.A.Utils.pp_edge)
+      edge_list;
+    push path edge_list;
+    Return
+
+  let return (name : string) (path : Path.t) =
+    TSLogger.debug ~level:2 "%s returned" name;
+    ignore @@ pop path;
+    (*
+      - Fetch transition list
+      - Update state
+      - Check if error state
+    let st = 
+      match pop path with
+      |t::[] -> 42
+      |t::q -> 43
+      |[] -> 
+    in
+    *)
+    ignore ts_state_key;
+    Return
 
   let initialization_callback (_ : Path.t) =
-    TSLogger.debug ~level:1 "Initialization_callback";
-    make_lb_automaton Engine.isa
+    make_lb_automaton Engine.isa;
+    Automaton.A.Utils.add_impossible_and_error_states lb_automaton
 
   let grammar_extension =
     [
@@ -196,7 +338,6 @@ struct
       Grammar_extension grammar_extension;
       Command_handler
         (fun _ (env : Script.env) path : bool ->
-          TSLogger.debug ~level:1 "Command_handler";
           let symbol_assoc_list =
             Automaton.A.fold_edges_e
               (fun e l ->
@@ -240,7 +381,7 @@ struct
                   Option.some
                   @@ Ir.Graph.of_script va
                        (String.cat "Hook_call_" elt)
-                       [ Opcode (Builtin (TS_call va)) ]
+                       [ Opcode (Builtin (TS_call elt)) ]
               | None -> None);
         };
       Instrumentation_routine
@@ -265,23 +406,24 @@ struct
                   with
                   | Item { elt; _ } ->
                       TSLogger.debug ~level:1 "Inserting return hook for %s" elt;
-                      Revision.insert_before graph vertex (Builtin TS_return)
+                      Revision.insert_before graph vertex
+                        (Builtin (TS_return elt))
                   | Empty -> ())
               | _ -> ())
             graph);
       Builtin_printer
         (fun ppf -> function
           | TS_call target ->
-              Format.fprintf ppf "typestate call %a" Virtual_address.pp target;
+              Format.fprintf ppf "typestate call - %s" target;
               true
-          | TS_return ->
-              Format.fprintf ppf "typestate return";
+          | TS_return target ->
+              Format.fprintf ppf "typestate return - %s" target;
               true
           | _ -> false);
       Builtin_resolver
         (function
         | TS_call target -> Call (call target)
-        | TS_return -> Call return
+        | TS_return target -> Call (return target)
         | _ -> Unknown);
     ]
 end
