@@ -73,9 +73,10 @@ module Automaton = struct
             string list =
           match l with
           | [] -> [ s ]
-          | t :: q when String.compare t s < 0 -> s :: t :: q
           | t :: q when String.compare t s = 0 -> t :: q
-          | t :: q -> t :: sorted_list_uniq_insert q s
+          | t :: q when String.compare t s < 0 ->
+              t :: sorted_list_uniq_insert q s
+          | t :: q -> s :: t :: q
         in
         let functions =
           fold_edges_e
@@ -87,15 +88,16 @@ module Automaton = struct
         TSLogger.debug ~level:2 "@[<v>List of all functions:@ %a@]"
           (Format.pp_print_list Format.pp_print_string)
           functions;
+        (* computes l - l' *)
         let rec sorted_list_uniq_diff l l' =
           match l' with
           | [] -> l
           | t' :: q' -> (
               match l with
               | [] -> []
+              | t :: q when String.equal t' t -> sorted_list_uniq_diff q q'
               | t :: q when String.compare t' t < 0 ->
                   t :: sorted_list_uniq_diff q q'
-              | t :: q when String.equal t' t -> sorted_list_uniq_diff q q'
               | t :: q -> t :: sorted_list_uniq_diff q l')
         in
         let to_iter_v (v : V.t) =
@@ -106,7 +108,15 @@ module Automaton = struct
                    n)
           in
           let flist = edge_list |> List.fold_left sorted_list_uniq_insert [] in
+          TSLogger.debug ~level:2 "@[<v>List of function present at <%s>:@ %a@]"
+            (sosl v)
+            (Format.pp_print_list Format.pp_print_string)
+            flist;
           let eflist = sorted_list_uniq_diff functions flist in
+          TSLogger.debug ~level:2
+            "@[<v>List of function missing from <%s>:@ %a@]" (sosl v)
+            (Format.pp_print_list Format.pp_print_string)
+            eflist;
           eflist
           |> List.iter (fun name ->
                  let vrai = Dba.Expr.constant Bitvector.one in
@@ -127,9 +137,24 @@ module Automaton = struct
             if String.equal n edge_name then edge :: acc else acc)
           t []
 
-      let is_constructor (e : E.t) =
-        let v, _, _ = e in
-        v = Bottom
+      let is_constructor (s : string) (t : t) =
+        false
+        |> fold_edges_e
+             (fun edge acc ->
+               let v, e, v' = edge in
+               if acc then acc
+               else
+                 let target_ok =
+                   match v' with
+                   | ErrorDefault | Error _ | Bottom | Impossible -> false
+                   | Ok _ -> true
+                 in
+                 let n, _, _ = e in
+                 if String.equal n s && v = Bottom && target_ok then (
+                   TSLogger.debug ~level:1 "found constructor: %a" pp_edge edge;
+                   true)
+                 else false)
+             t
     end
   end
 end
@@ -160,7 +185,6 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
   let off_broken = nv @@ Ok "off broken" in
   let on_ok = nv @@ Ok "on ok" in
   let on_broken = nv @@ Ok "on broken" in
-  let impossible_state = nv @@ Ok "Impossible state" in
   (* Edges *)
   let ne = Automaton.A.E.create in
   let nev e s e' = Automaton.A.E.create e (s, vrai, vrai) e' in
@@ -180,9 +204,7 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
   (* automaton *)
   let av = Automaton.A.add_vertex lb_automaton in
   let ae = Automaton.A.add_edge_e lb_automaton in
-  List.iter
-    (fun v -> av v)
-    [ bottom; off_ok; off_broken; on_ok; on_broken; impossible_state ];
+  List.iter (fun v -> av v) [ bottom; off_ok; off_broken; on_ok; on_broken ];
   List.iter
     (fun e -> ae e)
     [
@@ -236,7 +258,12 @@ struct
     | [] -> TSLogger.fatal "Popped from empty stack."
 
   type path = Path.t
-  type Ir.builtin += TS_call of string | TS_return of string
+  type is_constructor = bool
+
+  (* TODO builtin pour les constructeurs / destructeurs ? *)
+  type Ir.builtin += TS_call of string * is_constructor | TS_return of string
+  (* TODO when constructing the automaton, a function cannot be
+     a constructor and a normal method at the same time. *)
 
   let function_intervals = ref Zmap.empty
   let function_addresses : string ZtMap.t ref = ref @@ ZtMap.empty
@@ -269,23 +296,52 @@ struct
        - Call stack pour stocker les listes de transition.
        - Un champ state : Path.value (Symbolic.Default.Expr.t probablement)
   *)
-  let call (name : string) (path : Path.t) =
+
+  let call (name : string) (is_constructor : bool) (path : Path.t) =
+    ignore is_constructor;
     let unfiltered_edge_list =
       Automaton.A.Utils.find_edges_by_name name lb_automaton
+    in
+    (*TODO update constructor behaviour one day *)
+    let state =
+      if is_constructor then
+        Path.set path ts_state_key @@ Path.State.Value.constant
+        @@ Bitvector.of_int ~size:63 (Automaton.A.V.hash Bottom)
+      else ();
+      Path.get path ts_state_key
     in
     let edge_list =
       List.filter
         (fun e ->
-          let lbl = Automaton.A.E.label e in
+          let v, lbl, _ = e in
           let _, pred, _ = lbl in
           (* TODO est-ce que is_zero = Unknown => un possible ? *)
-          match Path.is_zero path pred with
-          | Unknown ->
-              TSLogger.warning
-                "Solver returned unknown while filtering edge at call site.";
-              true
-          | True -> false
-          | False -> true)
+          let predicate_filter =
+            match Path.is_zero path pred with
+            | Unknown ->
+                TSLogger.warning
+                  "Solver returned unknown while filtering edge at call site.";
+                true
+            | True -> false
+            | False -> true
+          in
+          let v_value =
+            Path.State.Value.constant
+            @@ Bitvector.of_int ~size:63 (Automaton.A.V.hash v)
+          in
+          let state_filter =
+            match
+              Path.State.Value.binary Symbolic.State.Eq v_value state
+              |> Path.is_zero_v path
+            with
+            | Unknown ->
+                TSLogger.warning
+                  "Solver returned unknown while filtering edge at call site.";
+                true
+            | True -> false
+            | False -> true
+          in
+          state_filter && predicate_filter)
         unfiltered_edge_list
     in
     TSLogger.debug ~level:2 "%s called" name;
@@ -377,11 +433,19 @@ struct
                 @@ !function_addresses
               with
               | Some elt ->
-                  TSLogger.debug ~level:1 "Inserting call hook for %s" elt;
-                  Option.some
-                  @@ Ir.Graph.of_script va
-                       (String.cat "Hook_call_" elt)
-                       [ Opcode (Builtin (TS_call elt)) ]
+                  if Automaton.A.Utils.is_constructor elt lb_automaton then (
+                    TSLogger.debug ~level:1 "Inserting constructor hook for %s"
+                      elt;
+                    Option.some
+                    @@ Ir.Graph.of_script va
+                         (String.cat "Hook_constructor_" elt)
+                         [ Opcode (Builtin (TS_call (elt, true))) ])
+                  else (
+                    TSLogger.debug ~level:1 "Inserting call hook for %s" elt;
+                    Option.some
+                    @@ Ir.Graph.of_script va
+                         (String.cat "Hook_call_" elt)
+                         [ Opcode (Builtin (TS_call (elt, false))) ])
               | None -> None);
         };
       Instrumentation_routine
@@ -413,8 +477,9 @@ struct
             graph);
       Builtin_printer
         (fun ppf -> function
-          | TS_call target ->
-              Format.fprintf ppf "typestate call - %s" target;
+          | TS_call (target, isc) ->
+              Format.fprintf ppf "typestate call - %s (%s)" target
+              @@ if isc then "constructor" else "method";
               true
           | TS_return target ->
               Format.fprintf ppf "typestate return - %s" target;
@@ -422,7 +487,7 @@ struct
           | _ -> false);
       Builtin_resolver
         (function
-        | TS_call target -> Call (call target)
+        | TS_call (target, isc) -> Call (call target isc)
         | TS_return target -> Call (return target)
         | _ -> Unknown);
     ]
@@ -432,9 +497,17 @@ module Plugin : PLUGIN = struct
   include ID
 
   let fields : (module PATH) -> field list =
-   fun _ ->
+   fun path ->
+    let module Path = (val path) in
     [
-      Field { id = TS_state; default = []; copy = None; merge = None };
+      Field
+        {
+          id = TS_state;
+          default =
+            Path.State.Value.constant @@ Binsec_kernel.Bitvector.zeros 63;
+          copy = None;
+          merge = None;
+        };
       Field { id = TS_call_stack; default = []; copy = None; merge = None };
     ]
 
