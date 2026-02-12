@@ -194,6 +194,8 @@ struct
         pour les fonctions manquantes d'un noeud.
       - Les transitions vers l'état Impossible sont ajoutées
         pour les fonctions dont les prédicats ne couvrent pas l'univers.
+
+        TODO ajouter la même chose pour le prédicat de call.
    *)
   let add_impossible_and_error_states : Automaton.A.t -> Path.t -> unit =
    fun t path ->
@@ -392,19 +394,57 @@ struct
 
   let return (name : string) (path : Path.t) =
     TSLogger.debug ~level:2 "%s returned" name;
-    ignore @@ pop path;
-    (*
-      - Fetch transition list
-      - Update state
-      - Check if error state
-    let st = 
-      match pop path with
-      |t::[] -> 42
-      |t::q -> 43
-      |[] -> 
+    (* Fetch quiver of available transitions and sort it. *)
+    let quiver =
+      List.to_seq
+      @@ List.sort (fun (v, _, _) (v', _, _) -> Automaton.A.V.compare v v')
+      @@ pop path
     in
+    (* Grouping transitions by common vertex *)
+    let gquiver =
+      Seq.group (fun (v, _, _) (v', _, _) -> Automaton.A.V.equal v v') quiver
+    in
+    (* Making the st variables for each group of vertex. *)
+    let st_list =
+      List.of_seq
+      @@ Seq.map
+           (fun (seq : Automaton.A.E.t Seq.t) ->
+             match seq () with
+             | Seq.Nil -> TSLogger.fatal "Empty sequence in grouped quiver."
+             | Seq.Cons (t, _) ->
+                 if Seq.length seq = 1 then
+                   let v, lbl, v' = t in
+                   let _, _, p = lbl in
+                   let open Path.State.Value in
+                   ( v,
+                     ite (Path.get_value path p)
+                       (constant @@ Bitvector.of_int ~size:63
+                      @@ Automaton.A.V.hash v')
+                       (constant @@ Bitvector.of_int ~size:63
+                       @@ Automaton.A.V.hash Impossible) )
+                 else TSLogger.fatal "TODO" (*TODO*))
+           gquiver
+    in
+    (* fetch current state *)
+    let current_state = Path.get path ts_state_key in
+    (* update state *)
+    let rec state_updater (l : (Automaton.A.V.t * Path.Value.t) list) =
+      match l with
+      | [] ->
+          Path.State.Value.constant @@ Bitvector.of_int ~size:63
+          @@ Automaton.A.V.hash Impossible
+      | (v, p) :: q ->
+          let open Path.State.Value in
+          ite
+            (binary Symbolic.State.Eq current_state
+               (constant @@ Bitvector.of_int ~size:63 @@ Automaton.A.V.hash v))
+            p (state_updater q)
+    in
+    Path.set path ts_state_key @@ state_updater st_list;
+    (*
+    TODO
+      - Check if error state
     *)
-    ignore ts_state_key;
     Return
 
   let initialization_callback (path : Path.t) =
