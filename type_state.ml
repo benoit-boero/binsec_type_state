@@ -55,78 +55,12 @@ module Automaton = struct
       let pp_edge ppf edge =
         let v, lbl, v' = edge in
         let e_name, expr, expr' = lbl in
-        Format.fprintf ppf
-          "@[<v>(%a) -- %s --> (%a)@   * Call Cond: %a@   * Return Cond: %a@]"
-          pp_vertex v e_name pp_vertex v' Binsec_sse_stake.pp_dba expr
-          Binsec_sse_stake.pp_dba expr'
-
-      (*
-        For each state v:
-          - we fetch the list of transition.
-          - for each functions that appears we add the impossible transitions
-            * If the complementary of the union of predicates is non empty we add that.
-          - we add the error transition for each function that is not present.
-      *)
-      let add_impossible_and_error_states t : unit =
-        let default_error_state = V.create ErrorDefault in
-        let rec sorted_list_uniq_insert (l : string list) (s : string) :
-            string list =
-          match l with
-          | [] -> [ s ]
-          | t :: q when String.compare t s = 0 -> t :: q
-          | t :: q when String.compare t s < 0 ->
-              t :: sorted_list_uniq_insert q s
-          | t :: q -> s :: t :: q
+        let pp_predicate ppf e =
+          if Dba.Expr.is_constant e then Format.fprintf ppf ""
+          else Format.fprintf ppf "[%a]" Binsec_sse_stake.pp_dba e
         in
-        let functions =
-          fold_edges_e
-            (fun (e : E.t) acc ->
-              let name, _, _ = E.label e in
-              sorted_list_uniq_insert acc name)
-            t []
-        in
-        TSLogger.debug ~level:2 "@[<v>List of all functions:@ %a@]"
-          (Format.pp_print_list Format.pp_print_string)
-          functions;
-        (* computes l - l' *)
-        let rec sorted_list_uniq_diff l l' =
-          match l' with
-          | [] -> l
-          | t' :: q' -> (
-              match l with
-              | [] -> []
-              | t :: q when String.equal t' t -> sorted_list_uniq_diff q q'
-              | t :: q when String.compare t' t < 0 ->
-                  t :: sorted_list_uniq_diff q q'
-              | t :: q -> t :: sorted_list_uniq_diff q l')
-        in
-        let to_iter_v (v : V.t) =
-          let edge_list =
-            succ_e t v
-            |> List.map (fun e ->
-                   let n, _, _ = E.label e in
-                   n)
-          in
-          let flist = edge_list |> List.fold_left sorted_list_uniq_insert [] in
-          TSLogger.debug ~level:2 "@[<v>List of function present at <%s>:@ %a@]"
-            (sosl v)
-            (Format.pp_print_list Format.pp_print_string)
-            flist;
-          let eflist = sorted_list_uniq_diff functions flist in
-          TSLogger.debug ~level:2
-            "@[<v>List of function missing from <%s>:@ %a@]" (sosl v)
-            (Format.pp_print_list Format.pp_print_string)
-            eflist;
-          eflist
-          |> List.iter (fun name ->
-                 let vrai = Dba.Expr.constant Bitvector.one in
-                 let label = (name, vrai, vrai) in
-                 let edge = E.create v label default_error_state in
-                 TSLogger.debug ~level:3 "@[<v>Completing automaton with:@ %a@]"
-                   pp_edge edge;
-                 add_edge_e t edge)
-        in
-        t |> iter_vertex to_iter_v
+        Format.fprintf ppf "@[<v>(%a) -- %a %s %a --> (%a)@]" pp_vertex v
+          pp_predicate expr e_name pp_predicate expr' pp_vertex v'
 
       let get_edge_name (e : E.t) = match E.label e with n, _, _ -> n
 
@@ -218,14 +152,6 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
       is_dead_on_ok;
       is_dead_or_broken;
     ]
-(* TODO
-   Impossible state pas nécessaire.
-   On le déduit du fait que les transitions d'un état donné,
-   pour une étiquette données, doivent couvrir l'univers.
-   Donc toutes les transitions qui sont dans le complémentaires des états valides sont impossibles.
-   Si pas de transition de cette étiquette alors état erreur.
-   L'utilisateur spécifie les états valides et possibles.
-*)
 
 module Make (Engine : ENGINE) : EXTENSIONS with type path = Engine.Path.t =
 struct
@@ -259,11 +185,124 @@ struct
 
   type path = Path.t
   type is_constructor = bool
-
-  (* TODO builtin pour les constructeurs / destructeurs ? *)
   type Ir.builtin += TS_call of string * is_constructor | TS_return of string
   (* TODO when constructing the automaton, a function cannot be
      a constructor and a normal method at the same time. *)
+
+  (** Ajoute les transitions manquantes dans l'automate. 
+      - Les transitions vers l'état ErrorDefault sont ajoutées 
+        pour les fonctions manquantes d'un noeud.
+      - Les transitions vers l'état Impossible sont ajoutées
+        pour les fonctions dont les prédicats ne couvrent pas l'univers.
+   *)
+  let add_impossible_and_error_states : Automaton.A.t -> Path.t -> unit =
+   fun t path ->
+    let open Automaton.A in
+    (* Default error state for the completion *)
+    let default_error_state = V.create ErrorDefault in
+    (* Impossible state for the completion *)
+    let impossible_state = V.create Impossible in
+    (* Computes l + s keeping uniqueness and ascending order *)
+    let rec sorted_list_uniq_insert (l : string list) (s : string) : string list
+        =
+      match l with
+      | [] -> [ s ]
+      | t :: q when String.compare t s = 0 -> t :: q
+      | t :: q when String.compare t s < 0 -> t :: sorted_list_uniq_insert q s
+      | t :: q -> s :: t :: q
+    in
+    (* computes l - l' keeping ascending order *)
+    let rec sorted_list_uniq_diff l l' =
+      match l' with
+      | [] -> l
+      | t' :: q' -> (
+          match l with
+          | [] -> []
+          | t :: q when String.equal t' t -> sorted_list_uniq_diff q q'
+          | t :: q when String.compare t' t < 0 ->
+              t :: sorted_list_uniq_diff q q'
+          | t :: q -> t :: sorted_list_uniq_diff q l')
+    in
+    (* List of all functions in the automaton *)
+    let functions =
+      fold_edges_e
+        (fun (e : E.t) acc ->
+          let name, _, _ = E.label e in
+          sorted_list_uniq_insert acc name)
+        t []
+    in
+    let to_iter_v (v : V.t) =
+      (* List of edges initially leaving the vertex. *)
+      let elist = succ_e t v in
+      (* Sorted list of functions leaving the vertex. *)
+      let flist =
+        elist
+        |> List.map (fun e ->
+               let n, _, _ = E.label e in
+               n)
+        |> List.fold_left sorted_list_uniq_insert []
+      in
+      TSLogger.debug ~level:2 "@[<v>@ [%s]@ Functions present:@ \t* %a@]"
+        (Automaton.sosl v)
+        (Format.pp_print_list
+           ~pp_sep:(fun ppf _ -> Format.fprintf ppf "@ \t* ")
+           Format.pp_print_string)
+        flist;
+      (* Sorted list of missing functions. *)
+      let eflist = sorted_list_uniq_diff functions flist in
+      TSLogger.debug ~level:2 "@[<v>Missing functions:@ \t* %a@]"
+        (Format.pp_print_list
+           ~pp_sep:(fun ppf _ -> Format.fprintf ppf "@ \t* ")
+           Format.pp_print_string)
+        eflist;
+      (* Adding missing functions as error transitions. *)
+      TSLogger.debug ~level:1 "Completing vertex with:";
+      eflist
+      |> List.iter (fun name ->
+             let vrai = Dba.Expr.constant Bitvector.one in
+             let label = (name, vrai, vrai) in
+             let edge = E.create v label default_error_state in
+             TSLogger.debug ~level:3 "@[<v>\t@[<v>* %a@]@]" Utils.pp_edge edge;
+             add_edge_e t edge);
+      (* should be the sequence of edge labels grouped by equal names *)
+      let glbl =
+        Seq.group (fun (s, _, _) (s', _, _) -> String.equal s s')
+        @@ List.to_seq (List.map (fun (_, lbl, _) -> lbl) elist)
+      in
+      (* list of function_name, predicate_disjonction *)
+      let plist =
+        Seq.map
+          (fun seq ->
+            seq
+            |> Seq.fold_left
+                 (fun (_, pacc) (n, _, p) ->
+                   (n, Dba.Expr.binary Dba.Binary_op.Or pacc p))
+                 ("", Dba.Expr.zero))
+          glbl
+      in
+      (* Seq of (function, impossible_predicate option) *)
+      let impseq =
+        Seq.map
+          (fun (n, p) ->
+            match Path.is_zero path p with
+            | False -> (n, None)
+            | True | Unknown ->
+                (n, Option.some @@ Dba.Expr.unary Dba.Unary_op.Not p))
+          plist
+      in
+      Seq.iter
+        (fun (n, po) ->
+          match po with
+          | None -> ()
+          | Some p ->
+              let lbl = (n, Dba.Expr.one, p) in
+              let edge = E.create v lbl impossible_state in
+              TSLogger.debug ~level:3 "@[<v>\t* %a@]" Utils.pp_edge edge;
+              add_edge_e t edge)
+        impseq
+    in
+    (* Iterating on all vertexes *)
+    t |> iter_vertex to_iter_v
 
   let function_intervals = ref Zmap.empty
   let function_addresses : string ZtMap.t ref = ref @@ ZtMap.empty
@@ -368,9 +407,9 @@ struct
     ignore ts_state_key;
     Return
 
-  let initialization_callback (_ : Path.t) =
+  let initialization_callback (path : Path.t) =
     make_lb_automaton Engine.isa;
-    Automaton.A.Utils.add_impossible_and_error_states lb_automaton
+    add_impossible_and_error_states lb_automaton path
 
   let grammar_extension =
     [
