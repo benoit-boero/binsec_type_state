@@ -98,6 +98,22 @@ module Automaton = struct
   end
 end
 
+module VertexTbl = struct
+  include Hashtbl.Make (struct
+    type t = Automaton.A.V.t
+
+    let equal = Automaton.A.V.equal
+    let hash = Automaton.A.V.hash
+  end)
+
+  let find_match tbl v =
+    match find_opt tbl v with
+    | Some i -> i
+    | None ->
+        TSLogger.fatal "The vertex identifier table contains no binding for %a"
+          Automaton.A.Utils.pp_vertex v
+end
+
 type Binsec_sse.Script.Ast.t += Def_automaton
 
 type ('value, 'model, 'state, 'path, 'a) field_id +=
@@ -192,6 +208,18 @@ struct
   type Ir.builtin += TS_call of string * is_constructor | TS_return of string
   (* TODO when constructing the automaton, a function cannot be
      a constructor and a normal method at the same time. *)
+
+  let v_id_tbl : int VertexTbl.t = VertexTbl.create 10
+  let ts_bitsize : int ref = ref 0
+
+  (** Expects tbl to be empty. *)
+  let make_v_id_tbl t (tbl : int VertexTbl.t) : unit =
+    let i = ref 0 in
+    Automaton.A.iter_vertex
+      (fun v ->
+        VertexTbl.add tbl v !i;
+        i := !i + 1)
+      t
 
   (** Ajoute les transitions manquantes dans l'automate. 
       - Les transitions vers l'état ErrorDefault sont ajoutées 
@@ -342,6 +370,9 @@ struct
      dans le path:
        - Call stack pour stocker les listes de transition.
        - Un champ state : Path.value (Symbolic.Default.Expr.t probablement)
+  (* TODO
+        grace à ça on peut faire Path.get path ts_state_key / Path.set path ts_state_key
+  *)
   *)
 
   (*
@@ -354,15 +385,15 @@ TODO
     let unfiltered_edge_list =
       (* TODO filtrer d'abbord en fonction de l'état puis en fonction des prédicats.
               faire qu'une requête au solveur en vérifiant les deux en mm temps avec un ET *)
-      (* TODO déplacer ça au moment de l'instrumentation *)
+      (* TODO déplacer ça au moment de l'instrumentation ? *)
       Automaton.A.Utils.find_edges_by_name name lb_automaton
     in
     (*TODO update constructor behaviour one day *)
     let state =
       if is_constructor then
         Path.set path ts_state_key @@ Path.State.Value.constant
-        (* TODO utiliser des identifiants uniques *)
-        @@ Bitvector.of_int ~size:63 (Automaton.A.V.hash Bottom)
+        @@ Bitvector.of_int ~size:!ts_bitsize
+        @@ VertexTbl.find_match v_id_tbl (Automaton.A.V.create Bottom)
       else ();
       Path.get path ts_state_key
     in
@@ -384,8 +415,10 @@ TODO
           in
           let v_value =
             Path.State.Value.constant
-            @@ Bitvector.of_int ~size:63 (Automaton.A.V.hash v)
+            @@ Bitvector.of_int ~size:!ts_bitsize
+            @@ VertexTbl.find_match v_id_tbl v
           in
+
           let state_filter =
             match
               Path.State.Value.binary Symbolic.State.Eq v_value state
@@ -435,10 +468,13 @@ TODO
                    let open Path.State.Value in
                    ( v,
                      ite (Path.get_value path p)
-                       (constant @@ Bitvector.of_int ~size:63
-                      @@ Automaton.A.V.hash v')
-                       (constant @@ Bitvector.of_int ~size:63
-                       @@ Automaton.A.V.hash Impossible) )
+                       (constant
+                       @@ Bitvector.of_int ~size:!ts_bitsize
+                       @@ VertexTbl.find_match v_id_tbl v')
+                       (constant
+                       @@ Bitvector.of_int ~size:!ts_bitsize
+                       @@ VertexTbl.find_match v_id_tbl
+                            (Automaton.A.V.create Impossible)) )
                  else
                    (*
                    let entropy =
@@ -461,15 +497,18 @@ TODO
     let rec state_updater (l : (Automaton.A.V.t * Path.Value.t) list) =
       match l with
       | [] ->
-          (* TODO quand le hash sera remplacé par un identifiant unique,
-             remplacer 63 par la taille minimale nécessaire. *)
-          Path.State.Value.constant @@ Bitvector.of_int ~size:63
-          @@ Automaton.A.V.hash Impossible
+          Path.State.Value.constant
+          @@ Bitvector.of_int ~size:!ts_bitsize
+          @@ VertexTbl.find_match v_id_tbl
+          @@ Automaton.A.V.create Impossible
       | (v, p) :: q ->
           let open Path.State.Value in
           ite
             (binary Symbolic.State.Eq current_state
-               (constant @@ Bitvector.of_int ~size:63 @@ Automaton.A.V.hash v))
+               (constant
+               @@ Bitvector.of_int ~size:!ts_bitsize
+               @@ VertexTbl.find_match v_id_tbl
+               @@ Automaton.A.V.create v))
             p (state_updater q)
     in
     Path.set path ts_state_key @@ state_updater st_list;
@@ -482,7 +521,13 @@ TODO
 
   let initialization_callback (path : Path.t) =
     make_lb_automaton Engine.isa;
-    add_impossible_and_error_states lb_automaton path
+    add_impossible_and_error_states lb_automaton path;
+    Automaton.A.Utils.make_v_id_tbl lb_automaton v_id_tbl;
+    ts_bitsize :=
+      int_of_float
+      @@ 1.
+         +. (log @@ float_of_int @@ Automaton.A.VertexTbl.length v_id_tbl)
+            /. log 2.
 
   (* regarder dans exec.ml ou script.ml comment c'est fait *)
   let grammar_extension =
@@ -616,8 +661,7 @@ module Plugin : PLUGIN = struct
       Field
         {
           id = TS_state;
-          default =
-            Path.State.Value.constant @@ Binsec_kernel.Bitvector.zeros 63;
+          default = Path.State.Value.zero;
           copy = None;
           merge = None;
         };
