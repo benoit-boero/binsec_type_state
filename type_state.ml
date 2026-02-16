@@ -522,12 +522,10 @@ TODO
   let initialization_callback (path : Path.t) =
     make_lb_automaton Engine.isa;
     add_impossible_and_error_states lb_automaton path;
-    Automaton.A.Utils.make_v_id_tbl lb_automaton v_id_tbl;
+    make_v_id_tbl lb_automaton v_id_tbl;
     ts_bitsize :=
       int_of_float
-      @@ 1.
-         +. (log @@ float_of_int @@ Automaton.A.VertexTbl.length v_id_tbl)
-            /. log 2.
+      @@ (1. +. ((log @@ float_of_int @@ VertexTbl.length v_id_tbl) /. log 2.))
 
   (* regarder dans exec.ml ou script.ml comment c'est fait *)
   let grammar_extension =
