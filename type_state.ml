@@ -1,3 +1,8 @@
+(*
+  - Rajouter le support du multi-objet avec une BitvectorMap.t
+  - écrire des tests pour deux objets.
+*)
+
 open Binsec_sse.Types
 
 module ID = struct
@@ -109,9 +114,9 @@ let lb_automaton = Automaton.A.create ()
 let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
   let open Binsec_kernel in
   let module MyIsaHelper = (val Isa_helper.get arch) in
-  let vrai = Dba.Expr.constant @@ Bitvector.one in
-  let faux = Dba.Expr.constant @@ Bitvector.zero in
   let rax = Dba.LValue.to_expr @@ MyIsaHelper.get_ret () in
+  let vrai = Dba.Expr.one in
+  let faux = Dba.Expr.zeros (Dba.Expr.size_of rax) in
   (* Vertexes *)
   let nv = Automaton.A.V.create in
   let bottom = nv Bottom in
@@ -133,7 +138,7 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
     ne on_ok ("is_dead", vrai, Dba.Expr.equal rax faux) on_ok
   in
   let is_dead_or_broken =
-    ne on_broken ("is_dead", vrai, Dba.Expr.equal rax vrai) on_broken
+    ne on_broken ("is_dead", vrai, Dba.Expr.diff rax faux) on_broken
   in
   (* automaton *)
   let av = Automaton.A.add_vertex lb_automaton in
@@ -165,9 +170,6 @@ struct
     let compare = Z.compare
   end)
 
-  (* TODO
-        grace à ça on peut faire Path.get path ts_state_key / Path.set path ts_state_key
-  *)
   let ts_call_stack_key = Engine.lookup TS_call_stack
   let ts_state_key = Engine.lookup TS_state
 
@@ -184,6 +186,8 @@ struct
     | [] -> TSLogger.fatal "Popped from empty stack."
 
   type path = Path.t
+
+  (* TODO rajouter les destructeurs *)
   type is_constructor = bool
   type Ir.builtin += TS_call of string * is_constructor | TS_return of string
   (* TODO when constructing the automaton, a function cannot be
@@ -204,6 +208,8 @@ struct
     let default_error_state = V.create ErrorDefault in
     (* Impossible state for the completion *)
     let impossible_state = V.create Impossible in
+    Automaton.A.add_vertex t default_error_state;
+    Automaton.A.add_vertex t impossible_state;
     (* Computes l + s keeping uniqueness and ascending order *)
     let rec sorted_list_uniq_insert (l : string list) (s : string) : string list
         =
@@ -286,10 +292,10 @@ struct
       let impseq =
         Seq.map
           (fun (n, p) ->
-            match Path.is_zero path p with
-            | False -> (n, None)
-            | True | Unknown ->
-                (n, Option.some @@ Dba.Expr.unary Dba.Unary_op.Not p))
+            let non_p = Dba.Expr.unary Dba.Unary_op.Not p in
+            match Path.check_sat_assuming path non_p with
+            | None -> (n, None)
+            | Some _ -> (n, Option.some non_p))
           plist
       in
       Seq.iter
@@ -338,15 +344,24 @@ struct
        - Un champ state : Path.value (Symbolic.Default.Expr.t probablement)
   *)
 
+  (*
+TODO
+  Il vaut mieux flagger les edge comme "constructeur" plutôt que le builtin.
+  
+  *)
+
   let call (name : string) (is_constructor : bool) (path : Path.t) =
-    ignore is_constructor;
     let unfiltered_edge_list =
+      (* TODO filtrer d'abbord en fonction de l'état puis en fonction des prédicats.
+              faire qu'une requête au solveur en vérifiant les deux en mm temps avec un ET *)
+      (* TODO déplacer ça au moment de l'instrumentation *)
       Automaton.A.Utils.find_edges_by_name name lb_automaton
     in
     (*TODO update constructor behaviour one day *)
     let state =
       if is_constructor then
         Path.set path ts_state_key @@ Path.State.Value.constant
+        (* TODO utiliser des identifiants uniques *)
         @@ Bitvector.of_int ~size:63 (Automaton.A.V.hash Bottom)
       else ();
       Path.get path ts_state_key
@@ -358,6 +373,7 @@ struct
           let _, pred, _ = lbl in
           (* TODO est-ce que is_zero = Unknown => un possible ? *)
           let predicate_filter =
+            (* TODO remplacer is_zero par check_sat_assume *)
             match Path.is_zero path pred with
             | Unknown ->
                 TSLogger.warning
@@ -373,6 +389,7 @@ struct
           let state_filter =
             match
               Path.State.Value.binary Symbolic.State.Eq v_value state
+              (* TODO replace is_zero *)
               |> Path.is_zero_v path
             with
             | Unknown ->
@@ -400,7 +417,7 @@ struct
       @@ List.sort (fun (v, _, _) (v', _, _) -> Automaton.A.V.compare v v')
       @@ pop path
     in
-    (* Grouping transitions by common vertex *)
+    (* Grouping transitions by common first vertex *)
     let gquiver =
       Seq.group (fun (v, _, _) (v', _, _) -> Automaton.A.V.equal v v') quiver
     in
@@ -422,7 +439,20 @@ struct
                       @@ Automaton.A.V.hash v')
                        (constant @@ Bitvector.of_int ~size:63
                        @@ Automaton.A.V.hash Impossible) )
-                 else TSLogger.fatal "TODO" (*TODO*))
+                 else
+                   (*
+                   let entropy =
+                     Dba.Var.create "entropy" ~bitsize:Size.Bit.bits32
+                       ~tag:Dba.Var.Tag.Temp
+                   in
+                   let sentropy = Path.symbolize path entropy in
+                   Seq.fold_left
+                   (fun acc (_,(_,_,p),v') -> )
+                   None
+                   seq
+                    in
+                    *)
+                   TSLogger.fatal "TODO" (*TODO*))
            gquiver
     in
     (* fetch current state *)
@@ -431,6 +461,8 @@ struct
     let rec state_updater (l : (Automaton.A.V.t * Path.Value.t) list) =
       match l with
       | [] ->
+          (* TODO quand le hash sera remplacé par un identifiant unique,
+             remplacer 63 par la taille minimale nécessaire. *)
           Path.State.Value.constant @@ Bitvector.of_int ~size:63
           @@ Automaton.A.V.hash Impossible
       | (v, p) :: q ->
@@ -443,6 +475,7 @@ struct
     Path.set path ts_state_key @@ state_updater st_list;
     (*
     TODO
+      - Assume not impossible Path.State.assume
       - Check if error state
     *)
     Return
@@ -451,6 +484,7 @@ struct
     make_lb_automaton Engine.isa;
     add_impossible_and_error_states lb_automaton path
 
+  (* regarder dans exec.ml ou script.ml comment c'est fait *)
   let grammar_extension =
     [
       Dyp.Add_rules
