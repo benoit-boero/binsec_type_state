@@ -2,6 +2,7 @@
   - Rajouter le support du multi-objet avec une BitvectorMap.t
   - écrire des tests pour deux objets.
 *)
+let compose f g x = f (g x)
 
 open Binsec_sse.Types
 
@@ -79,27 +80,47 @@ module Automaton = struct
             if String.equal n edge_name then edge :: acc else acc)
           t []
 
-      let is_constructor (s : string) (t : t) =
-        false
-        |> fold_edges_e
-             (fun edge acc ->
-               let v, e, v' = edge in
-               if acc then acc
-               else
-                 let target_ok =
-                   match v' with
-                   | ErrorDefault | Error _ | Bottom | Impossible -> false
-                   | Ok _ -> true
-                 in
-                 let n, _, _ = e in
-                 if String.equal n s && v = Bottom && target_ok then (
-                   TSLogger.debug ~level:1 "found constructor: %a" pp_edge edge;
-                   true)
-                 else false)
-             t
+      let is_constructor (e : E.t) =
+        let v, _, v' = e in
+        let src_ok =
+          match v with
+          | Bottom -> true
+          | Ok _ | Impossible | ErrorDefault | Error _ -> false
+        in
+        let trgt_ok =
+          match v' with
+          | ErrorDefault | Error _ | Bottom | Impossible -> false
+          | Ok _ -> true
+        in
+        src_ok && trgt_ok
+
+      let is_destructor (e : E.t) =
+        let v, _, v' = e in
+        let src_ok =
+          match v with
+          | Ok _ -> true
+          | Bottom | Impossible | ErrorDefault | Error _ -> false
+        in
+        let trgt_ok =
+          match v' with
+          | ErrorDefault | Error _ | Ok _ | Impossible -> false
+          | Bottom -> true
+        in
+        src_ok && trgt_ok
     end
   end
 end
+
+type sym_kind =
+  | Constructor of Automaton.A.E.t
+  | Method of Automaton.A.E.t
+  | Destructor of Automaton.A.E.t
+
+let map_sym_kind (f : Automaton.A.E.t -> 'b) sym_kind =
+  match sym_kind with
+  | Constructor l -> f l
+  | Method l -> f l
+  | Destructor l -> f l
 
 module VertexTbl = struct
   include Hashtbl.Make (struct
@@ -120,8 +141,7 @@ end
 type Binsec_sse.Script.Ast.t += Def_automaton
 
 type ('value, 'model, 'state, 'path, 'a) field_id +=
-  | TS_call_stack :
-      ('value, 'model, 'state, 'path, Automaton.A.E.t list list) field_id
+  | TS_call_stack : ('value, 'model, 'state, 'path, sym_kind list list) field_id
     (*TODO
           'value -> 'value Bitvector.Map.t String.Map.t -> 'value Value.Map.t String.Map.t
         - Le Value.Map.add renvoit l'information sur si il faut forker ou pas et comment.
@@ -192,7 +212,14 @@ struct
   let ts_call_stack_key = Engine.lookup TS_call_stack
   let ts_state_key = Engine.lookup TS_state
 
-  let push (path : Path.t) (x : Automaton.A.E.t list) =
+  type path = Path.t
+
+  (* TODO rajouter les destructeurs *)
+  type Ir.builtin += TS_call of string * sym_kind list | TS_return of string
+  (* TODO when constructing the automaton, a function cannot be
+     a constructor and a normal method at the same time. *)
+
+  let push (path : Path.t) (x : sym_kind list) =
     let curr = Path.get path ts_call_stack_key in
     Path.set path ts_call_stack_key (x :: curr)
 
@@ -203,14 +230,6 @@ struct
         Path.set path ts_call_stack_key q;
         t
     | [] -> TSLogger.fatal "Popped from empty stack."
-
-  type path = Path.t
-
-  (* TODO rajouter les destructeurs *)
-  type is_constructor = bool
-  type Ir.builtin += TS_call of string * is_constructor | TS_return of string
-  (* TODO when constructing the automaton, a function cannot be
-     a constructor and a normal method at the same time. *)
 
   let v_id_tbl : int VertexTbl.t = VertexTbl.create 10
   let ts_bitsize : int ref = ref 0
@@ -227,6 +246,12 @@ struct
         i := !i + 1)
       t
 
+  (* Default error state for the completion *)
+  let default_error_state = Automaton.A.(V.create ErrorDefault)
+
+  (* Impossible state for the completion *)
+  let impossible_state = Automaton.A.(V.create Impossible)
+
   (** Ajoute les transitions manquantes dans l'automate. 
       - Les transitions vers l'état ErrorDefault sont ajoutées 
         pour les fonctions manquantes d'un noeud.
@@ -237,11 +262,8 @@ struct
    *)
   let add_impossible_and_error_states : Automaton.A.t -> Path.t -> unit =
    fun t path ->
+    TSLogger.info "completing automaton";
     let open Automaton.A in
-    (* Default error state for the completion *)
-    let default_error_state = V.create ErrorDefault in
-    (* Impossible state for the completion *)
-    let impossible_state = V.create Impossible in
     Automaton.A.add_vertex t default_error_state;
     Automaton.A.add_vertex t impossible_state;
     (* Computes l + s keeping uniqueness and ascending order *)
@@ -303,9 +325,12 @@ struct
       |> List.iter (fun name ->
              let vrai = Dba.Expr.constant Bitvector.one in
              let label = (name, vrai, vrai) in
-             let edge = E.create v label default_error_state in
-             TSLogger.debug ~level:3 "@[<v>\t@[<v>* %a@]@]" Utils.pp_edge edge;
-             add_edge_e t edge);
+             (* We do not complete the Impossible state *)
+             if Automaton.A.V.equal v impossible_state then ()
+             else
+               let edge = E.create v label default_error_state in
+               TSLogger.debug ~level:3 "@[<v>\t@[<v>* %a@]@]" Utils.pp_edge edge;
+               add_edge_e t edge);
       (* should be the sequence of edge labels grouped by equal names *)
       let glbl =
         Seq.group (fun (s, _, _) (s', _, _) -> String.equal s s')
@@ -348,6 +373,7 @@ struct
 
   let function_intervals = ref Zmap.empty
   let function_addresses : string ZtMap.t ref = ref @@ ZtMap.empty
+  let user_errors : Automaton.A.V.t list ref = ref []
 
   let make_function_intervals
       (symlist : (string * Z.t * Z.t) (* name, addr, size *) list) : unit =
@@ -381,77 +407,118 @@ struct
   (*
 TODO
   Il vaut mieux flagger les edge comme "constructeur" plutôt que le builtin.
-  
   *)
 
-  let call (name : string) (is_constructor : bool) (path : Path.t) =
-    let unfiltered_edge_list =
-      (* TODO filtrer d'abbord en fonction de l'état puis en fonction des prédicats.
-              faire qu'une requête au solveur en vérifiant les deux en mm temps avec un ET *)
-      (* TODO déplacer ça au moment de l'instrumentation ? *)
-      Automaton.A.Utils.find_edges_by_name name lb_automaton
+  let filter_sat path (p : Path.Value.t) : bool =
+    match Path.check_sat_assuming_v path p with None -> false | Some _ -> true
+
+  let call (name : string) (quiver : sym_kind list) (path : Path.t) =
+    (* Fetching current state *)
+    let curr_state = Path.get path ts_state_key in
+    (* If the state is uninitialized we push only constructor arrows. *)
+    let filtered_quiver =
+      if
+        (not @@ Path.State.is_symbolic curr_state @@ Path.state path)
+        && (Bitvector.equal uninitialized_state @@ Path.eval_v path curr_state)
+      then
+        List.filter
+          (fun es -> match es with Constructor _ -> true | _ -> false)
+          quiver
+      else
+        (* else we filter based on state and call predicate *)
+        List.filter
+          (fun es ->
+            map_sym_kind
+              (fun e ->
+                let v, lbl, _ = e in
+                let _, pred, _ = lbl in
+                let state_filter =
+                  curr_state
+                  |> Path.State.Value.binary Symbolic.State.Eq
+                     @@ Path.State.Value.constant
+                     @@ Bitvector.of_int ~size:!ts_bitsize
+                     @@ VertexTbl.find_match v_id_tbl v
+                in
+                let predicate_filter = Path.get_value path pred in
+                let final_filter =
+                  Path.State.Value.binary Symbolic.State.And state_filter
+                    predicate_filter
+                in
+                filter_sat path final_filter)
+              es)
+          quiver
     in
-    (*TODO update constructor behaviour one day *)
-    let state =
-      if is_constructor then (
+    push path filtered_quiver;
+    TSLogger.debug ~level:2 "%s called" name;
+    TSLogger.debug ~level:2 "@[<v>Filtered at call:@ %a@]"
+      (Format.pp_print_list (fun ppf e ->
+           Format.fprintf ppf "%a"
+             (fun ppf e -> map_sym_kind (Automaton.A.Utils.pp_edge ppf) e)
+             e))
+      filtered_quiver;
+    Return
+
+  let return (name : string) (path : Path.t) =
+    let impossible_state_v =
+      Path.State.Value.constant
+      @@ Bitvector.of_int ~size:!ts_bitsize
+      @@ VertexTbl.find_match v_id_tbl impossible_state
+    in
+    TSLogger.debug ~level:2 "%s returned" name;
+    (* Fetch quiver of available transitions and sort it. *)
+    let quiver = pop path in
+    (* Else we sort transitions in three buckets *)
+    let c_list, d_list, m_list =
+      let rec partition3 acc l =
+        match l with
+        | [] -> acc
+        | t :: q -> (
+            let cl, dl, ml = acc in
+            q
+            |> partition3
+               @@
+               match t with
+               | Constructor l -> (l :: cl, dl, ml)
+               | Destructor l -> (cl, l :: dl, ml)
+               | Method l -> (cl, dl, l :: ml))
+      in
+      partition3 ([], [], []) quiver
+    in
+    (* One and only one of c_list/d_list/m_list should be non-empty. *)
+    (* TODO chech that *)
+    let cnt =
+      let list_to_int l = if l = [] then 0 else 1 in
+      list_to_int c_list + list_to_int d_list + list_to_int m_list
+    in
+    if cnt <> 1 then
+      TSLogger.fatal
+        "Automaton allows empty quiver / destructor-constructor-method \
+         ambiguity";
+    (* List of transition to be taken. *)
+    let to_be_taken =
+      (* If we are a constructor we construct. *)
+      if c_list <> [] then (
         let s =
           Path.State.Value.constant
           @@ Bitvector.of_int ~size:!ts_bitsize
           @@ VertexTbl.find_match v_id_tbl (Automaton.A.V.create Bottom)
         in
         Path.set path ts_state_key s;
-        s)
-      else
-        let s = Path.get path ts_state_key in
-        if Path.State.is_symbolic s @@ Path.state path then s
-        else if Bitvector.equal uninitialized_state @@ Path.eval_v path s then
-          TSLogger.fatal "Type state was not initialized before use."
-        else s
+        c_list)
+      else if m_list <> [] then m_list
+      else d_list
     in
-    let edge_list =
-      List.filter
-        (fun e ->
-          let v, lbl, _ = e in
-          let _, pred, _ = lbl in
-          let predicate_filter =
-            match Path.check_sat_assuming path pred with
-            | None -> false
-            | Some _ -> true
-          in
-          let v_value =
-            Path.State.Value.constant
-            @@ Bitvector.of_int ~size:!ts_bitsize
-            @@ VertexTbl.find_match v_id_tbl v
-          in
-          let state_filter =
-            match
-              Path.State.Value.binary Symbolic.State.Eq v_value state
-              |> Path.check_sat_assuming_v path
-            with
-            | None -> false
-            | Some _ -> true
-          in
-          state_filter && predicate_filter)
-        unfiltered_edge_list
-    in
-    TSLogger.debug ~level:2 "%s called" name;
-    TSLogger.debug ~level:2 "@[<v>Filtered at call:@ %a@]"
-      (Format.pp_print_list Automaton.A.Utils.pp_edge)
-      edge_list;
-    push path edge_list;
-    Return
-
-  let return (name : string) (path : Path.t) =
-    TSLogger.debug ~level:2 "%s returned" name;
-    (* Fetch quiver of available transitions and sort it. *)
-    let quiver =
+    (* Sorting transition that will be taken by first vertex *)
+    let sorted_quiver =
       List.to_seq
       @@ List.sort (fun (v, _, _) (v', _, _) -> Automaton.A.V.compare v v')
-      @@ pop path
+      @@ to_be_taken
     in
     (* Grouping transitions by common first vertex *)
     let gquiver =
-      Seq.group (fun (v, _, _) (v', _, _) -> Automaton.A.V.equal v v') quiver
+      Seq.group
+        (fun (v, _, _) (v', _, _) -> Automaton.A.V.equal v v')
+        sorted_quiver
     in
     (* Making the st variables for each group of vertex. *)
     let st_list =
@@ -461,6 +528,8 @@ TODO
              match seq () with
              | Seq.Nil -> TSLogger.fatal "Empty sequence in grouped quiver."
              | Seq.Cons (t, _) ->
+                 let l = List.of_seq seq in
+                 ignore l;
                  if Seq.length seq = 1 then
                    let v, lbl, v' = t in
                    let _, _, p = lbl in
@@ -472,22 +541,34 @@ TODO
                        @@ VertexTbl.find_match v_id_tbl v')
                        (constant
                        @@ Bitvector.of_int ~size:!ts_bitsize
-                       @@ VertexTbl.find_match v_id_tbl
-                            (Automaton.A.V.create Impossible)) )
+                       @@ VertexTbl.find_match v_id_tbl impossible_state) )
                  else
-                   (*
-                   let entropy =
-                     Dba.Var.create "entropy" ~bitsize:Size.Bit.bits32
-                       ~tag:Dba.Var.Tag.Temp
+                   let _, s =
+                     let entropy =
+                       Path.lookup path
+                       (* TODO use minimum size necessary *)
+                       @@ Dba.Var.create "entropy" ~bitsize:Size.Bit.bits32
+                            ~tag:Dba.Var.Tag.Temp
+                     in
+                     (ref 0, impossible_state_v)
+                     |> List.fold_right (fun (_, (_, _, p), v') (i, acc) ->
+                            i := !i + 1;
+                            ( i,
+                              Path.State.Value.ite
+                                (Path.State.Value.binary Symbolic.State.And
+                                   (Path.get_value path p)
+                                @@ Path.State.Value.binary Symbolic.State.Eq
+                                     entropy
+                                @@ Path.State.Value.constant
+                                @@ Bitvector.of_int ~size:32 !i)
+                                (Path.State.Value.constant
+                                @@ Bitvector.of_int ~size:!ts_bitsize
+                                @@ VertexTbl.find_match v_id_tbl v')
+                                acc ))
+                        @@ l
                    in
-                   let sentropy = Path.symbolize path entropy in
-                   Seq.fold_left
-                   (fun acc (_,(_,_,p),v') -> )
-                   None
-                   seq
-                    in
-                    *)
-                   TSLogger.fatal "TODO" (*TODO*))
+                   let v, _, _ = List.hd l in
+                   (v, s))
            gquiver
     in
     (* fetch current state *)
@@ -495,11 +576,7 @@ TODO
     (* update state *)
     let rec state_updater (l : (Automaton.A.V.t * Path.Value.t) list) =
       match l with
-      | [] ->
-          Path.State.Value.constant
-          @@ Bitvector.of_int ~size:!ts_bitsize
-          @@ VertexTbl.find_match v_id_tbl
-          @@ Automaton.A.V.create Impossible
+      | [] -> impossible_state_v
       | (v, p) :: q ->
           let open Path.State.Value in
           ite
@@ -510,22 +587,56 @@ TODO
                @@ Automaton.A.V.create v))
             p (state_updater q)
     in
-    Path.set path ts_state_key @@ state_updater st_list;
-    (*
-    TODO
-      - Assume not impossible Path.State.assume
-      - Check if error state
-    *)
+    let new_state = state_updater st_list in
+    Path.set path ts_state_key new_state;
+    (* Assuming we are not on the impossible state *)
+    (match
+       Path.assume_v path
+         (Path.State.Value.binary Symbolic.State.Diff new_state
+            impossible_state_v)
+     with
+    | None -> TSLogger.fatal "Impossible state cannot be avoided."
+    | Some _ -> ());
+    (* Check if we can be on any error state. *)
+    let default_error_state_v =
+      Path.State.Value.constant
+      @@ Bitvector.of_int ~size:!ts_bitsize
+      @@ VertexTbl.find_match v_id_tbl default_error_state
+    in
+    let predicate =
+      List.fold_right
+        (fun x acc ->
+          Path.State.Value.binary Symbolic.State.Or acc
+          @@ Path.State.Value.binary Symbolic.State.Eq new_state
+          @@ Path.State.Value.constant
+          @@ Bitvector.of_int ~size:!ts_bitsize
+          @@ VertexTbl.find_match v_id_tbl x)
+        !user_errors
+      @@ Path.State.Value.binary Symbolic.State.Eq new_state
+           default_error_state_v
+    in
+    if filter_sat path predicate then TSLogger.fatal "API misuage.";
     Return
 
   let initialization_callback (path : Path.t) =
+    TSLogger.info "init callback";
+    (* Make automaton *)
     make_lb_automaton Engine.isa;
+    (* Complete automaton *)
     add_impossible_and_error_states lb_automaton path;
+    (* Make state identifiers *)
     make_v_id_tbl lb_automaton v_id_tbl;
+    (* Init type state bitsize *)
     ts_bitsize :=
       int_of_float
       @@ (1. +. ((log @@ float_of_int @@ VertexTbl.length v_id_tbl) /. log 2.));
-    TSLogger.debug ~level:4 "Type State Bitsize: %d" !ts_bitsize
+    TSLogger.debug ~level:4 "Type State Bitsize: %d" !ts_bitsize;
+    (* Compute list of all error states *)
+    user_errors :=
+      Automaton.A.fold_vertex
+        (fun v acc ->
+          match v with Error _ | Automaton.ErrorDefault -> v :: acc | _ -> acc)
+        lb_automaton []
 
   (* regarder dans exec.ml ou script.ml comment c'est fait *)
   let grammar_extension =
@@ -589,19 +700,36 @@ TODO
                 @@ !function_addresses
               with
               | Some elt ->
-                  if Automaton.A.Utils.is_constructor elt lb_automaton then (
-                    TSLogger.debug ~level:1 "Inserting constructor hook for %s"
-                      elt;
-                    Option.some
-                    @@ Ir.Graph.of_script va
-                         (String.cat "Hook_constructor_" elt)
-                         [ Opcode (Builtin (TS_call (elt, true))) ])
-                  else (
-                    TSLogger.debug ~level:1 "Inserting call hook for %s" elt;
-                    Option.some
-                    @@ Ir.Graph.of_script va
-                         (String.cat "Hook_call_" elt)
-                         [ Opcode (Builtin (TS_call (elt, false))) ])
+                  let quiver =
+                    Automaton.A.fold_edges_e
+                      (fun e acc ->
+                        let _, lbl, _ = e in
+                        let n, _, _ = lbl in
+                        if String.equal n elt then
+                          if Automaton.A.Utils.is_constructor e then
+                            Constructor e :: acc
+                          else if Automaton.A.Utils.is_destructor e then
+                            Destructor e :: acc
+                          else Method e :: acc
+                        else acc)
+                      lb_automaton []
+                    |> List.sort (fun e e' ->
+                           match (e, e') with
+                           | Constructor _, Constructor _ -> 0
+                           | Destructor _, Destructor _ -> 0
+                           | Method _, Method _ -> 0
+                           | Constructor _, Destructor _ -> -1
+                           | Destructor _, Constructor _ -> 1
+                           | Constructor _, Method _ -> -2
+                           | Method _, Constructor _ -> 2
+                           | Destructor _, Method _ -> -1
+                           | Method _, Destructor _ -> 1)
+                  in
+                  TSLogger.debug ~level:1 "Inserting call hook for %s" elt;
+                  Option.some
+                  @@ Ir.Graph.of_script va
+                       (String.cat "Hook_call_" elt)
+                       [ Opcode (Builtin (TS_call (elt, quiver))) ]
               | None -> None);
         };
       Instrumentation_routine
@@ -633,9 +761,8 @@ TODO
             graph);
       Builtin_printer
         (fun ppf -> function
-          | TS_call (target, isc) ->
-              Format.fprintf ppf "typestate call - %s (%s)" target
-              @@ if isc then "constructor" else "method";
+          | TS_call (target, _) ->
+              Format.fprintf ppf "typestate call - %s" target;
               true
           | TS_return target ->
               Format.fprintf ppf "typestate return - %s" target;
@@ -643,7 +770,7 @@ TODO
           | _ -> false);
       Builtin_resolver
         (function
-        | TS_call (target, isc) -> Call (call target isc)
+        | TS_call (target, quiver) -> Call (call target quiver)
         | TS_return target -> Call (return target)
         | _ -> Unknown);
     ]
