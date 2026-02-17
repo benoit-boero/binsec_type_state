@@ -214,10 +214,13 @@ struct
 
   (** Expects tbl to be empty. *)
   let make_v_id_tbl t (tbl : int VertexTbl.t) : unit =
+    TSLogger.debug ~level:4 "State identification:";
     let i = ref 0 in
     Automaton.A.iter_vertex
       (fun v ->
         VertexTbl.add tbl v !i;
+        TSLogger.debug ~level:4 "\t* %a identified as %d."
+          Automaton.A.Utils.pp_vertex v !i;
         i := !i + 1)
       t
 
@@ -370,9 +373,6 @@ struct
      dans le path:
        - Call stack pour stocker les listes de transition.
        - Un champ state : Path.value (Symbolic.Default.Expr.t probablement)
-  (* TODO
-        grace à ça on peut faire Path.get path ts_state_key / Path.set path ts_state_key
-  *)
   *)
 
   (*
@@ -402,35 +402,23 @@ TODO
         (fun e ->
           let v, lbl, _ = e in
           let _, pred, _ = lbl in
-          (* TODO est-ce que is_zero = Unknown => un possible ? *)
           let predicate_filter =
-            (* TODO remplacer is_zero par check_sat_assume *)
-            match Path.is_zero path pred with
-            | Unknown ->
-                TSLogger.warning
-                  "Solver returned unknown while filtering edge at call site.";
-                true
-            | True -> false
-            | False -> true
+            match Path.check_sat_assuming path pred with
+            | None -> false
+            | Some _ -> true
           in
           let v_value =
             Path.State.Value.constant
             @@ Bitvector.of_int ~size:!ts_bitsize
             @@ VertexTbl.find_match v_id_tbl v
           in
-
           let state_filter =
             match
               Path.State.Value.binary Symbolic.State.Eq v_value state
-              (* TODO replace is_zero *)
-              |> Path.is_zero_v path
+              |> Path.check_sat_assuming_v path
             with
-            | Unknown ->
-                TSLogger.warning
-                  "Solver returned unknown while filtering edge at call site.";
-                true
-            | True -> false
-            | False -> true
+            | None -> false
+            | Some _ -> true
           in
           state_filter && predicate_filter)
         unfiltered_edge_list
@@ -525,7 +513,8 @@ TODO
     make_v_id_tbl lb_automaton v_id_tbl;
     ts_bitsize :=
       int_of_float
-      @@ (1. +. ((log @@ float_of_int @@ VertexTbl.length v_id_tbl) /. log 2.))
+      @@ (1. +. ((log @@ float_of_int @@ VertexTbl.length v_id_tbl) /. log 2.));
+    TSLogger.debug ~level:4 "Type State Bitsize: %d" !ts_bitsize
 
   (* regarder dans exec.ml ou script.ml comment c'est fait *)
   let grammar_extension =
