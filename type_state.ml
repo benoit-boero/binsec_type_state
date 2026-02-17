@@ -13,6 +13,9 @@ module TSLogger = Binsec_sse.Logger.Sub (struct
   let name = "type-state"
 end)
 
+let uninitialized_state =
+  Binsec_kernel.Bitvector.of_hexstring "0xdeadf00ddeadf00d"
+
 module Automaton = struct
   open Binsec_kernel
 
@@ -390,12 +393,20 @@ TODO
     in
     (*TODO update constructor behaviour one day *)
     let state =
-      if is_constructor then
-        Path.set path ts_state_key @@ Path.State.Value.constant
-        @@ Bitvector.of_int ~size:!ts_bitsize
-        @@ VertexTbl.find_match v_id_tbl (Automaton.A.V.create Bottom)
-      else ();
-      Path.get path ts_state_key
+      if is_constructor then (
+        let s =
+          Path.State.Value.constant
+          @@ Bitvector.of_int ~size:!ts_bitsize
+          @@ VertexTbl.find_match v_id_tbl (Automaton.A.V.create Bottom)
+        in
+        Path.set path ts_state_key s;
+        s)
+      else
+        let s = Path.get path ts_state_key in
+        if Path.State.is_symbolic s @@ Path.state path then s
+        else if Bitvector.equal uninitialized_state @@ Path.eval_v path s then
+          TSLogger.fatal "Type state was not initialized before use."
+        else s
     in
     let edge_list =
       List.filter
@@ -648,7 +659,7 @@ module Plugin : PLUGIN = struct
       Field
         {
           id = TS_state;
-          default = Path.State.Value.zero;
+          default = Path.Value.constant @@ uninitialized_state;
           copy = None;
           merge = None;
         };
