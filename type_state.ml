@@ -213,8 +213,6 @@ struct
   let ts_state_key = Engine.lookup TS_state
 
   type path = Path.t
-
-  (* TODO rajouter les destructeurs *)
   type Ir.builtin += TS_call of string * sym_kind list | TS_return of string
   (* TODO when constructing the automaton, a function cannot be
      a constructor and a normal method at the same time. *)
@@ -258,7 +256,6 @@ struct
       - Les transitions vers l'état Impossible sont ajoutées
         pour les fonctions dont les prédicats ne couvrent pas l'univers.
 
-        TODO ajouter la même chose pour le prédicat de call.
    *)
   let add_impossible_and_error_states : Automaton.A.t -> Path.t -> unit =
    fun t path ->
@@ -508,11 +505,21 @@ TODO
       else if m_list <> [] then m_list
       else d_list
     in
+    (* filtering based on return predicate *)
+    let to_be_taken_filtered =
+      List.filter
+        (fun e ->
+          let _, lbl, _ = e in
+          let _, _, pred = lbl in
+          let predicate_filter = Path.get_value path pred in
+          filter_sat path predicate_filter)
+        to_be_taken
+    in
     (* Sorting transition that will be taken by first vertex *)
     let sorted_quiver =
       List.to_seq
       @@ List.sort (fun (v, _, _) (v', _, _) -> Automaton.A.V.compare v v')
-      @@ to_be_taken
+      @@ to_be_taken_filtered
     in
     (* Grouping transitions by common first vertex *)
     let gquiver =
