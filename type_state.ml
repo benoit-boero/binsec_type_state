@@ -401,11 +401,6 @@ struct
        - Un champ state : Path.value (Symbolic.Default.Expr.t probablement)
   *)
 
-  (*
-TODO
-  Il vaut mieux flagger les edge comme "constructeur" plutôt que le builtin.
-  *)
-
   let filter_sat path (p : Path.Value.t) : bool =
     match Path.check_sat_assuming_v path p with None -> false | Some _ -> true
 
@@ -622,7 +617,27 @@ TODO
       @@ Path.State.Value.binary Symbolic.State.Eq new_state
            default_error_state_v
     in
-    if filter_sat path predicate then TSLogger.fatal "API misuage.";
+    (if filter_sat path predicate then
+       let states_bv = Bitvector.Map.keys @@ Path.enumerate_v path new_state in
+       let states_str =
+         VertexTbl.fold
+           (fun name id acc ->
+             if
+               List.exists
+                 (fun bv ->
+                   Bitvector.equal bv @@ Bitvector.of_int ~size:!ts_bitsize id)
+                 states_bv
+             then name :: acc
+             else acc)
+           v_id_tbl []
+       in
+       TSLogger.fatal
+         "@[<hov>API misuage. The automaton is in the supperposition of \
+          states: [%a]@]"
+         (Format.pp_print_list
+            ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
+            Automaton.A.Utils.pp_vertex)
+         states_str);
     Return
 
   let initialization_callback (path : Path.t) =
