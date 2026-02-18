@@ -177,8 +177,14 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
   let is_dead_on_ok =
     ne on_ok ("is_dead", vrai, Dba.Expr.equal rax faux) on_ok
   in
-  let is_dead_or_broken =
+  let is_dead_on_broken =
     ne on_broken ("is_dead", vrai, Dba.Expr.diff rax faux) on_broken
+  in
+  let is_dead_off_ok =
+    ne off_ok ("is_dead", vrai, Dba.Expr.equal rax faux) off_ok
+  in
+  let is_dead_off_broken =
+    ne off_broken ("is_dead", vrai, Dba.Expr.diff rax faux) off_broken
   in
   (* automaton *)
   let av = Automaton.A.add_vertex lb_automaton in
@@ -195,7 +201,9 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
       turn_off_ok;
       turn_off_broken;
       is_dead_on_ok;
-      is_dead_or_broken;
+      is_dead_on_broken;
+      is_dead_off_ok;
+      is_dead_off_broken;
     ]
 
 module Make (Engine : ENGINE) : EXTENSIONS with type path = Engine.Path.t =
@@ -630,18 +638,39 @@ struct
            default_error_state_v
     in
     if filter_sat path predicate then (
-      let states_bv = Bitvector.Map.keys @@ Path.enumerate_v path new_state in
-      TSLogger.debug ~level:4 "Length : %d BV: %a" (List.length states_bv)
+      let new_state_bv =
+        Bitvector.Map.keys @@ Path.enumerate_v path new_state
+      in
+      TSLogger.debug ~level:4 "Length : %d BV: %a" (List.length new_state_bv)
         (Format.pp_print_list Bitvector.pp)
-        states_bv;
-      let states_str =
+        new_state_bv;
+      let new_state_str =
         VertexTbl.fold
           (fun name id acc ->
             if
               List.exists
                 (fun bv ->
                   Bitvector.equal bv @@ Bitvector.of_int ~size:!ts_bitsize id)
-                states_bv
+                new_state_bv
+            then name :: acc
+            else acc)
+          v_id_tbl []
+      in
+      let current_state_bv =
+        Bitvector.Map.keys @@ Path.enumerate_v path current_state
+      in
+      TSLogger.debug ~level:4 "Length : %d BV: %a"
+        (List.length current_state_bv)
+        (Format.pp_print_list Bitvector.pp)
+        current_state_bv;
+      let current_state_str =
+        VertexTbl.fold
+          (fun name id acc ->
+            if
+              List.exists
+                (fun bv ->
+                  Bitvector.equal bv @@ Bitvector.of_int ~size:!ts_bitsize id)
+                current_state_bv
             then name :: acc
             else acc)
           v_id_tbl []
@@ -656,12 +685,16 @@ struct
         List.rev @@ popper ()
       in
       TSLogger.fatal
-        "@[<v>API misusage.@ The automaton is in the supperposition of \
-         states:@ [%a]@ Call trace leading to this state:@ %a@]"
+        "@[<v>API misusage.@ Last transition:@   [%a] -- (%s) --> [%a]@ Call \
+         trace leading to this state:@   %a@]"
         (Format.pp_print_list
            ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
            Automaton.A.Utils.pp_vertex)
-        states_str
+        current_state_str name
+        (Format.pp_print_list
+           ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
+           Automaton.A.Utils.pp_vertex)
+        new_state_str
         (Format.pp_print_list
            ~pp_sep:(fun ppf _ -> Format.fprintf ppf " -> ")
            Format.pp_print_string)
