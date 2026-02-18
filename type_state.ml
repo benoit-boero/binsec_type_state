@@ -142,6 +142,7 @@ type Binsec_sse.Script.Ast.t += Def_automaton
 
 type ('value, 'model, 'state, 'path, 'a) field_id +=
   | TS_call_stack : ('value, 'model, 'state, 'path, sym_kind list list) field_id
+  | TS_call_trace : ('value, 'model, 'state, 'path, string list) field_id
     (*TODO
           'value -> 'value Bitvector.Map.t String.Map.t -> 'value Value.Map.t String.Map.t
         - Le Value.Map.add renvoit l'information sur si il faut forker ou pas et comment.
@@ -210,6 +211,7 @@ struct
   end)
 
   let ts_call_stack_key = Engine.lookup TS_call_stack
+  let ts_call_trace_key = Engine.lookup TS_call_trace
   let ts_state_key = Engine.lookup TS_state
 
   type path = Path.t
@@ -217,17 +219,25 @@ struct
   (* TODO when constructing the automaton, a function cannot be
      a constructor and a normal method at the same time. *)
 
-  let push (path : Path.t) (x : sym_kind list) =
-    let curr = Path.get path ts_call_stack_key in
-    Path.set path ts_call_stack_key (x :: curr)
+  let push (path : Path.t) (x : 'a) (key : 'a list Path.key) =
+    let curr = Path.get path key in
+    Path.set path key (x :: curr)
 
-  let pop (path : Path.t) =
-    let curr = Path.get path ts_call_stack_key in
+  let pop (path : Path.t) (key : 'a list Path.key) : 'a option =
+    let curr = Path.get path key in
     match curr with
     | t :: q ->
-        Path.set path ts_call_stack_key q;
-        t
-    | [] -> TSLogger.fatal "Popped from empty stack."
+        Path.set path key q;
+        Option.some t
+    | [] -> None
+
+  let push_call_stack (path : Path.t) (x : sym_kind list) =
+    push path x ts_call_stack_key
+
+  let pop_call_stack (path : Path.t) =
+    match pop path ts_call_stack_key with
+    | Some x -> x
+    | None -> TSLogger.fatal "Popped from empty stack"
 
   let v_id_tbl : int VertexTbl.t = VertexTbl.create 10
   let ts_bitsize : int ref = ref 0
@@ -405,6 +415,8 @@ struct
     match Path.check_sat_assuming_v path p with None -> false | Some _ -> true
 
   let call (name : string) (quiver : sym_kind list) (path : Path.t) =
+    (* Pushing the function called in the call trace *)
+    push path name ts_call_trace_key;
     (* Fetching current state *)
     let curr_state = Path.get path ts_state_key in
     (* If the state is uninitialized we push only constructor arrows. *)
@@ -440,7 +452,7 @@ struct
               es)
           quiver
     in
-    push path filtered_quiver;
+    push_call_stack path filtered_quiver;
     TSLogger.debug ~level:2 "%s called" name;
     TSLogger.debug ~level:2 "@[<v>Filtered at call:@ %a@]"
       (Format.pp_print_list (fun ppf e ->
@@ -458,7 +470,7 @@ struct
     in
     TSLogger.debug ~level:2 "%s returned" name;
     (* Fetch quiver of available transitions and sort it. *)
-    let quiver = pop path in
+    let quiver = pop_call_stack path in
     (* Else we sort transitions in three buckets *)
     let c_list, d_list, m_list =
       let rec partition3 acc l =
@@ -617,27 +629,43 @@ struct
       @@ Path.State.Value.binary Symbolic.State.Eq new_state
            default_error_state_v
     in
-    (if filter_sat path predicate then
-       let states_bv = Bitvector.Map.keys @@ Path.enumerate_v path new_state in
-       let states_str =
-         VertexTbl.fold
-           (fun name id acc ->
-             if
-               List.exists
-                 (fun bv ->
-                   Bitvector.equal bv @@ Bitvector.of_int ~size:!ts_bitsize id)
-                 states_bv
-             then name :: acc
-             else acc)
-           v_id_tbl []
-       in
-       TSLogger.fatal
-         "@[<hov>API misuage. The automaton is in the supperposition of \
-          states: [%a]@]"
-         (Format.pp_print_list
-            ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
-            Automaton.A.Utils.pp_vertex)
-         states_str);
+    if filter_sat path predicate then (
+      let states_bv = Bitvector.Map.keys @@ Path.enumerate_v path new_state in
+      TSLogger.debug ~level:4 "Length : %d BV: %a" (List.length states_bv)
+        (Format.pp_print_list Bitvector.pp)
+        states_bv;
+      let states_str =
+        VertexTbl.fold
+          (fun name id acc ->
+            if
+              List.exists
+                (fun bv ->
+                  Bitvector.equal bv @@ Bitvector.of_int ~size:!ts_bitsize id)
+                states_bv
+            then name :: acc
+            else acc)
+          v_id_tbl []
+      in
+      (* TODO Est-ce la bonne manière d'intérompre l'exploration ? *)
+      let call_trace : string list =
+        let rec popper (_ : unit) =
+          match pop path ts_call_trace_key with
+          | Some s -> s :: popper ()
+          | None -> []
+        in
+        List.rev @@ popper ()
+      in
+      TSLogger.fatal
+        "@[<v>API misusage.@ The automaton is in the supperposition of \
+         states:@ [%a]@ Call trace leading to this state:@ %a@]"
+        (Format.pp_print_list
+           ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
+           Automaton.A.Utils.pp_vertex)
+        states_str
+        (Format.pp_print_list
+           ~pp_sep:(fun ppf _ -> Format.fprintf ppf " -> ")
+           Format.pp_print_string)
+        call_trace);
     Return
 
   let initialization_callback (path : Path.t) =
@@ -813,6 +841,7 @@ module Plugin : PLUGIN = struct
           merge = None;
         };
       Field { id = TS_call_stack; default = []; copy = None; merge = None };
+      Field { id = TS_call_trace; default = []; copy = None; merge = None };
     ]
 
   let extensions :
