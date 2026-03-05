@@ -378,13 +378,24 @@ struct
            Format.pp_print_string)
         eflist;
       (* Get locations *)
+      (* TODO créer un set plutôt que de filter une liste *)
       let get_locations (n : string) =
-        fold_edges_e
-          (fun e acc ->
-            let _, lbl, _ = e in
-            let name, _, _, loc = lbl in
-            if String.equal name n then loc :: acc else acc)
-          t []
+        List.sort_uniq (fun loc loc' ->
+            let open Automaton in
+            match (loc, loc') with
+            | Call dba, Call dba' | Return dba, Return dba' ->
+                if Dba.Expr.is_equal dba dba' then 0 else -1
+            | _ -> -1)
+        @@ fold_edges_e
+             (fun e acc ->
+               let _, lbl, _ = e in
+               let name, _, _, loc = lbl in
+               if
+                 String.equal name n
+                 && match loc with Call _ -> true | Return _ -> false
+               then loc :: acc
+               else acc)
+             t []
       in
       (* Adding missing functions as error transitions. *)
       TSLogger.debug ~level:1 "Completing vertex with:";
@@ -520,6 +531,9 @@ struct
   let call (name : string) (quiver : sym_list * sym_list * sym_list)
       (path : Path.t) =
     (* Pushing the function called in the call trace *)
+    (* TODO
+       C'est pas si simple. Il faut une Map Objet -> trace
+    *)
     push path name ts_call_trace_key;
     (* validity of input -> TODO use GADT ?*)
     let c_list, d_list, m_list =
@@ -578,8 +592,12 @@ struct
                     TSLogger.warning "%s: Called with untracked object." name;
                     inspect_filter [] false)
             | None ->
-                TSLogger.warning "%s: Called with symbolic or null object." name;
-                inspect_filter [] false)
+                let _, (_, p, _, _), _ = t in
+                if filter_sat path @@ Path.get_value path p then (
+                  TSLogger.warning "%s: Called with symbolic or null object."
+                    name;
+                  inspect_filter [] false)
+                else inspect_filter q true)
       else ([], false)
     in
     let group_by_object (l : (Bitvector.t * Automaton.A.E.t) list) :
@@ -781,7 +799,7 @@ struct
     let process_object (l : (Bitvector.t * Automaton.A.E.t) list) =
       if List.length l = 0 then Return
       else
-        (* Filter based on call Return predicate *)
+        (* Filter based on return predicate *)
         let edges = filter_predicate @@ List.map snd l in
         let st_vars = make_st_list edges in
         let addr = fst @@ List.hd l in
