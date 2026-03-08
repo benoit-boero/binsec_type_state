@@ -155,7 +155,13 @@ type ('value, 'model, 'state, 'path, 'a) field_id +=
         * (Binsec_kernel.Bitvector.t * Automaton.A.E.t) list list)
         list )
       field_id
-  | TS_call_trace : ('value, 'model, 'state, 'path, string list) field_id
+  | TS_call_trace :
+      ( 'value,
+        'model,
+        'state,
+        'path,
+        string list Binsec_kernel.Bitvector.Map.t )
+      field_id
     (*TODO
           'value -> 'value Bitvector.Map.t String.Map.t -> 'value Value.Map.t String.Map.t
         - Le Value.Map.add renvoit l'information sur si il faut forker ou pas et comment.
@@ -167,12 +173,6 @@ type ('value, 'model, 'state, 'path, 'a) field_id +=
         'path,
         'value Binsec_kernel.Bitvector.Map.t )
       field_id
-
-(* TODO
-   Make a table string -> Path.value.
-
-   It will give the expression to evaluate to get the address of the object.
-*)
 
 let lb_automaton = Automaton.A.create ()
 
@@ -530,11 +530,6 @@ struct
     *)
   let call (name : string) (quiver : sym_list * sym_list * sym_list)
       (path : Path.t) =
-    (* Pushing the function called in the call trace *)
-    (* TODO
-       C'est pas si simple. Il faut une Map Objet -> trace
-    *)
-    push path name ts_call_trace_key;
     (* validity of input -> TODO use GADT ?*)
     let c_list, d_list, m_list =
       match quiver with
@@ -584,6 +579,7 @@ struct
                 let s = get_obj_state path addr in
                 match s with
                 | Some state ->
+                    (* processing *)
                     if filter t state then
                       let rl, rb = inspect_filter q true in
                       ((addr, t) :: rl, rb)
@@ -628,64 +624,6 @@ struct
             group_by_object @@ fst f_d_list,
             group_by_object @@ fst f_m_list );
         Return
-  (*
-    (* Getting object's address *)
-    let obj_addr = get_obj_addr path name in
-    let filtered_quiver =
-      (* If the object is not tracked we push only constructor arrows. *)
-      if
-        (*
-        String.equal name "buy"
-        *)
-        obj_addr = None
-        ||
-        (TSLogger.info "adress : %a" Bitvector.pp_hex @@ Option.get obj_addr;
-         get_obj_state path @@ Option.get obj_addr = None)
-      then
-        List.filter
-          (fun es -> match es with Constructor _ -> true | _ -> false)
-          quiver
-      else
-        (* Fetching current state *)
-        let curr_state =
-          match get_obj_state path @@ Option.get obj_addr with
-          | None ->
-              TSLogger.fatal
-                "Automaton function called on an object that is not tracked !"
-          | Some s -> Some s
-        in
-        (* else we filter based on state and call predicate *)
-        List.filter
-          (fun es ->
-            map_sym_kind
-              (fun e ->
-                let v, lbl, _ = e in
-                let _, pred, _ = lbl in
-                let state_filter =
-                  Option.get curr_state
-                  |> Path.State.Value.binary Symbolic.State.Eq
-                     @@ Path.State.Value.constant
-                     @@ Bitvector.of_int ~size:!ts_bitsize
-                     @@ VertexTbl.find_match v_id_tbl v
-                in
-                let predicate_filter = Path.get_value path pred in
-                let final_filter =
-                  Path.State.Value.binary Symbolic.State.And state_filter
-                    predicate_filter
-                in
-                filter_sat path final_filter)
-              es)
-          quiver
-    in
-    push_call_stack path filtered_quiver;
-    TSLogger.debug ~level:2 "%s called" name;
-    TSLogger.debug ~level:2 "@[<v>Filtered at call:@ %a@]"
-      (Format.pp_print_list (fun ppf e ->
-           Format.fprintf ppf "%a"
-             (fun ppf e -> map_sym_kind (Automaton.A.Utils.pp_edge ppf) e)
-             e))
-      filtered_quiver
-      *)
 
   (** 
       This function should :
@@ -880,12 +818,19 @@ struct
                       v_id_tbl []
                   in
                   let call_trace : string list =
-                    List.rev @@ Path.get path ts_call_trace_key
+                    List.rev
+                    @@
+                    match
+                      Bitvector.Map.find_opt addr
+                      @@ Path.get path ts_call_trace_key
+                    with
+                    | Some l -> l
+                    | None -> [ name ]
                   in
                   TSLogger.warning
                     "@[<v>Object %a:@ API misusage.@ Last transition:@   [%a] \
-                     -- (%s) --> [%a]@ Call trace leading to this state:@   \
-                     %a@]"
+                     -- (%s) --> [%a]@ Call trace leading to this state:@   %a \
+                     --> %s@]"
                     Bitvector.pp_hex addr
                     (Format.pp_print_list
                        ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
@@ -898,9 +843,20 @@ struct
                     (Format.pp_print_list
                        ~pp_sep:(fun ppf _ -> Format.fprintf ppf " -> ")
                        Format.pp_print_string)
-                    call_trace;
+                    call_trace name;
                   Signal Cut)
-                else Return)
+                else (
+                  (* update call trace for that object. *)
+                  TSLogger.debug ~level:3
+                    "%s: Updating call trace for object %a" name
+                    Bitvector.pp_hex addr;
+                  let map = Path.get path ts_call_trace_key in
+                  let lo = Bitvector.Map.find_opt addr map in
+                  Path.set path ts_call_trace_key
+                  @@ Bitvector.Map.add addr
+                       (match lo with Some l -> name :: l | None -> [ name ])
+                       map;
+                  Return))
     in
     (* Construct *)
     let rec construct_object (l : Automaton.A.E.t list) =
@@ -913,6 +869,15 @@ struct
               let bmap = Path.enumerate path ~n:2 dba in
               if Bitvector.Map.cardinal bmap = 1 then (
                 let addr = List.hd @@ Bitvector.Map.keys bmap in
+                (* update call trace for that object. *)
+                TSLogger.debug ~level:3 "%s: Updating call trace for object %a"
+                  name Bitvector.pp_hex addr;
+                let map = Path.get path ts_call_trace_key in
+                let lo = Bitvector.Map.find_opt addr map in
+                Path.set path ts_call_trace_key
+                @@ Bitvector.Map.add addr
+                     (match lo with Some l -> name :: l | None -> [ name ])
+                     map;
                 set_obj_state path addr @@ Path.Value.constant
                 @@ Bitvector.of_int ~size:!ts_bitsize
                 @@ Automaton.A.V.hash v';
@@ -1350,7 +1315,13 @@ module Plugin : PLUGIN = struct
           merge = None;
         };
       Field { id = TS_call_stack; default = []; copy = None; merge = None };
-      Field { id = TS_call_trace; default = []; copy = None; merge = None };
+      Field
+        {
+          id = TS_call_trace;
+          default = Binsec_kernel.Bitvector.Map.empty;
+          copy = None;
+          merge = None;
+        };
     ]
 
   let extensions :
