@@ -512,6 +512,21 @@ struct
     let map = Path.get path ts_state_key in
     Bitvector.Map.find_opt addr map
 
+  let state_str_of_state_value path state =
+    let current_state_bv = Bitvector.Map.keys @@ Path.enumerate_v path state in
+    VertexTbl.fold
+      (fun name id acc ->
+        if
+          List.exists
+            (fun bv ->
+              Bitvector.equal bv @@ Bitvector.of_int ~size:!ts_bitsize id)
+            current_state_bv
+        then name :: acc
+        else acc)
+      v_id_tbl []
+
+  let id_of_state (v : Automaton.A.V.t) = VertexTbl.find_opt v_id_tbl v
+
   (*
     Au moment du call:
       - Séparer les transitions entre d'une part les 
@@ -564,7 +579,15 @@ struct
       let final_filter =
         Path.State.Value.binary Symbolic.State.And state_filter predicate_filter
       in
-      filter_sat path final_filter
+      let state_str = state_str_of_state_value path state in
+      let b = filter_sat path final_filter in
+      TSLogger.debug ~level:3
+        "Call %s: %s %a (based on current state being : %a)" name
+        (match b with true -> "Keeping" | false -> "Filtering out")
+        Automaton.A.Utils.pp_edge e
+        (Format.pp_print_list Automaton.A.Utils.pp_vertex)
+        state_str;
+      b
     in
     let rec inspect_filter (l : Automaton.A.E.t list) bool :
         (Bitvector.t * Automaton.A.E.t) list * bool =
@@ -797,25 +820,8 @@ struct
                         else acc)
                       v_id_tbl []
                   in
-                  let current_state_bv =
-                    Bitvector.Map.keys @@ Path.enumerate_v path curr_state
-                  in
-                  TSLogger.debug ~level:4 "Length : %d BV: %a"
-                    (List.length current_state_bv)
-                    (Format.pp_print_list Bitvector.pp)
-                    current_state_bv;
                   let current_state_str =
-                    VertexTbl.fold
-                      (fun name id acc ->
-                        if
-                          List.exists
-                            (fun bv ->
-                              Bitvector.equal bv
-                              @@ Bitvector.of_int ~size:!ts_bitsize id)
-                            current_state_bv
-                        then name :: acc
-                        else acc)
-                      v_id_tbl []
+                    state_str_of_state_value path curr_state
                   in
                   let call_trace : string list =
                     List.rev
@@ -878,9 +884,16 @@ struct
                 @@ Bitvector.Map.add addr
                      (match lo with Some l -> name :: l | None -> [ name ])
                      map;
+                (* Construct *)
+                TSLogger.debug ~level:3
+                  "Return %s : Constructing object %a with state %a (id %d) \
+                   based on edge %a"
+                  name Bitvector.pp_hex addr Automaton.A.Utils.pp_vertex v'
+                  (Option.get @@ id_of_state v')
+                  Automaton.A.Utils.pp_edge t;
                 set_obj_state path addr @@ Path.Value.constant
                 @@ Bitvector.of_int ~size:!ts_bitsize
-                @@ Automaton.A.V.hash v';
+                @@ Option.get @@ id_of_state v';
                 construct_object q)
               else Signal Cut)
     in
@@ -1226,18 +1239,11 @@ struct
                         let _, lbl, _ = e in
                         let n, _, _, _ = lbl in
                         if String.equal n elt then
-                          if Automaton.A.Utils.is_constructor e then (
-                            TSLogger.info "Constructor : %a"
-                              Automaton.A.Utils.pp_edge e;
-                            (e :: c, d, m))
-                          else if Automaton.A.Utils.is_destructor e then (
-                            TSLogger.info "Destructor : %a"
-                              Automaton.A.Utils.pp_edge e;
-                            (c, e :: d, m))
-                          else (
-                            TSLogger.info "Method : %a"
-                              Automaton.A.Utils.pp_edge e;
-                            (c, d, e :: m))
+                          if Automaton.A.Utils.is_constructor e then
+                            (e :: c, d, m)
+                          else if Automaton.A.Utils.is_destructor e then
+                            (c, e :: d, m)
+                          else (c, d, e :: m)
                         else acc)
                       lb_automaton ([], [], [])
                   in
