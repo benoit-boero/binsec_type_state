@@ -1,7 +1,3 @@
-(*
-  - Rajouter le support du multi-objet avec une BitvectorMap.t
-  - écrire des tests pour deux objets.
-*)
 let compose f g x = f (g x)
 
 open Binsec_sse.Types
@@ -13,9 +9,6 @@ end
 module TSLogger = Binsec_sse.Logger.Sub (struct
   let name = "type-state"
 end)
-
-let uninitialized_state =
-  Binsec_kernel.Bitvector.of_hexstring "0xdeadf00ddeadf00d"
 
 module Automaton = struct
   open Binsec_kernel
@@ -245,16 +238,6 @@ struct
 
     let compare = Z.compare
   end)
-  (* TODO
-      Annoter les transitions ave la position de l'objet
-
-      au moment du call:
-        List.mapfilter sur les transitions
-          on garde les constructeurs
-          pour les autres on évalue les objets
-
-          on push les constructeurs et la map objet -> transitions
-  *)
 
   let ts_call_stack_key = Engine.lookup TS_call_stack
   let ts_call_trace_key = Engine.lookup TS_call_trace
@@ -320,7 +303,7 @@ struct
    *)
   let add_impossible_and_error_states : Automaton.A.t -> Path.t -> unit =
    fun t path ->
-    TSLogger.info "completing automaton";
+    TSLogger.debug ~level:1 "Completing automaton";
     let open Automaton.A in
     Automaton.A.add_vertex t default_error_state;
     Automaton.A.add_vertex t impossible_state;
@@ -911,244 +894,6 @@ struct
       let m_process = batch_process m_list in
       if m_process = Return then construct_object c_list else m_process
     else d_process
-  (*
-    let impossible_state_v =
-      Path.State.Value.constant
-      @@ Bitvector.of_int ~size:!ts_bitsize
-      @@ VertexTbl.find_match v_id_tbl impossible_state
-    in
-    TSLogger.debug ~level:2 "%s returned" name;
-    (* Fetch object address *)
-    let obj_addr =
-      match get_obj_addr path name with
-      | None -> TSLogger.fatal "%s: Object's address is symbolic." name
-      | Some a -> a
-    in
-    (* Fetch quiver of available transitions and sort it. *)
-    let quiver = pop_call_stack path in
-    (* Else we sort transitions in three buckets *)
-    let c_list, d_list, m_list =
-      let rec partition3 acc l =
-        match l with
-        | [] -> acc
-        | t :: q -> (
-            let cl, dl, ml = acc in
-            q
-            |> partition3
-               @@
-               match t with
-               | Constructor l -> (l :: cl, dl, ml)
-               | Destructor l -> (cl, l :: dl, ml)
-               | Method l -> (cl, dl, l :: ml))
-      in
-      partition3 ([], [], []) quiver
-    in
-    (* One and only one of c_list/d_list/m_list should be non-empty. *)
-    (* TODO chech that *)
-    let cnt =
-      let list_to_int l = if l = [] then 0 else 1 in
-      list_to_int c_list + list_to_int d_list + list_to_int m_list
-    in
-    if cnt <> 1 then
-      TSLogger.fatal
-        "Automaton allows empty quiver / destructor - constructor - method \
-         ambiguity";
-    (* List of transition to be taken. *)
-    let to_be_taken =
-      (* If we are a constructor we construct. *)
-      if c_list <> [] then (
-        TSLogger.info "tracking object stored at %a" Bitvector.pp_hex obj_addr;
-        let s =
-          Path.State.Value.constant
-          @@ Bitvector.of_int ~size:!ts_bitsize
-          @@ VertexTbl.find_match v_id_tbl (Automaton.A.V.create Bottom)
-        in
-        set_obj_state path obj_addr s;
-        c_list)
-      else if m_list <> [] then m_list
-      else d_list
-    in
-    (* filtering based on return predicate *)
-    let to_be_taken_filtered =
-      List.filter
-        (fun e ->
-          let _, lbl, _ = e in
-          let _, _, pred = lbl in
-          let predicate_filter = Path.get_value path pred in
-          filter_sat path predicate_filter)
-        to_be_taken
-    in
-    (* Sorting transition that will be taken by first vertex *)
-    let sorted_quiver =
-      List.to_seq
-      @@ List.sort (fun (v, _, _) (v', _, _) -> Automaton.A.V.compare v v')
-      @@ to_be_taken_filtered
-    in
-    (* Grouping transitions by common first vertex *)
-    let gquiver =
-      Seq.group
-        (fun (v, _, _) (v', _, _) -> Automaton.A.V.equal v v')
-        sorted_quiver
-    in
-    (* Making the st variables for each group of vertex. *)
-    let st_list =
-      List.of_seq
-      @@ Seq.map
-           (fun (seq : Automaton.A.E.t Seq.t) ->
-             match seq () with
-             | Seq.Nil -> TSLogger.fatal "Empty sequence in grouped quiver."
-             | Seq.Cons (t, _) ->
-                 let l = List.of_seq seq in
-                 ignore l;
-                 if Seq.length seq = 1 then
-                   let v, lbl, v' = t in
-                   let _, _, p = lbl in
-                   let open Path.State.Value in
-                   ( v,
-                     ite (Path.get_value path p)
-                       (constant
-                       @@ Bitvector.of_int ~size:!ts_bitsize
-                       @@ VertexTbl.find_match v_id_tbl v')
-                       (constant
-                       @@ Bitvector.of_int ~size:!ts_bitsize
-                       @@ VertexTbl.find_match v_id_tbl impossible_state) )
-                 else
-                   let _, s =
-                     let entropy =
-                       Path.lookup path
-                       (* TODO use minimum size necessary -> Size.Bit.create *)
-                       @@ Dba.Var.create "entropy" ~bitsize:Size.Bit.bits32
-                            ~tag:Dba.Var.Tag.Temp
-                     in
-                     (ref 0, impossible_state_v)
-                     |> List.fold_right (fun (_, (_, _, p), v') (i, acc) ->
-                            i := !i + 1;
-                            ( i,
-                              Path.State.Value.ite
-                                (Path.State.Value.binary Symbolic.State.And
-                                   (Path.get_value path p)
-                                @@ Path.State.Value.binary Symbolic.State.Eq
-                                     entropy
-                                @@ Path.State.Value.constant
-                                @@ Bitvector.of_int ~size:32 !i)
-                                (Path.State.Value.constant
-                                @@ Bitvector.of_int ~size:!ts_bitsize
-                                @@ VertexTbl.find_match v_id_tbl v')
-                                acc ))
-                        @@ l
-                   in
-                   let v, _, _ = List.hd l in
-                   (v, s))
-           gquiver
-    in
-    (* fetch current state *)
-    let current_state =
-      match get_obj_state path obj_addr with
-      | None -> TSLogger.fatal "Called on an object that is not tracked."
-      | Some s -> s
-    in
-    (* update state *)
-    let rec state_updater (l : (Automaton.A.V.t * Path.Value.t) list) =
-      match l with
-      | [] -> impossible_state_v
-      | (v, p) :: q ->
-          let open Path.State.Value in
-          ite
-            (binary Symbolic.State.Eq current_state
-               (constant
-               @@ Bitvector.of_int ~size:!ts_bitsize
-               @@ VertexTbl.find_match v_id_tbl
-               @@ Automaton.A.V.create v))
-            p (state_updater q)
-    in
-    let new_state = state_updater st_list in
-    set_obj_state path obj_addr new_state;
-    (* Assuming we are not on the impossible state *)
-    (match
-       Path.assume_v path
-         (Path.State.Value.binary Symbolic.State.Diff new_state
-            impossible_state_v)
-     with
-    | None -> TSLogger.fatal "Impossible state cannot be avoided."
-    | Some _ -> ());
-    (* Check if we can be on any error state. *)
-    let default_error_state_v =
-      Path.State.Value.constant
-      @@ Bitvector.of_int ~size:!ts_bitsize
-      @@ VertexTbl.find_match v_id_tbl default_error_state
-    in
-    let predicate =
-      List.fold_right
-        (fun x acc ->
-          Path.State.Value.binary Symbolic.State.Or acc
-          @@ Path.State.Value.binary Symbolic.State.Eq new_state
-          @@ Path.State.Value.constant
-          @@ Bitvector.of_int ~size:!ts_bitsize
-          @@ VertexTbl.find_match v_id_tbl x)
-        !user_errors
-      @@ Path.State.Value.binary Symbolic.State.Eq new_state
-           default_error_state_v
-    in
-    if filter_sat path predicate then (
-      let new_state_bv =
-        Bitvector.Map.keys @@ Path.enumerate_v path new_state
-      in
-      TSLogger.debug ~level:4 "Length : %d BV: %a" (List.length new_state_bv)
-        (Format.pp_print_list Bitvector.pp)
-        new_state_bv;
-      let new_state_str =
-        VertexTbl.fold
-          (fun name id acc ->
-            if
-              List.exists
-                (fun bv ->
-                  Bitvector.equal bv @@ Bitvector.of_int ~size:!ts_bitsize id)
-                new_state_bv
-            then name :: acc
-            else acc)
-          v_id_tbl []
-      in
-      let current_state_bv =
-        Bitvector.Map.keys @@ Path.enumerate_v path current_state
-      in
-      TSLogger.debug ~level:4 "Length : %d BV: %a"
-        (List.length current_state_bv)
-        (Format.pp_print_list Bitvector.pp)
-        current_state_bv;
-      let current_state_str =
-        VertexTbl.fold
-          (fun name id acc ->
-            if
-              List.exists
-                (fun bv ->
-                  Bitvector.equal bv @@ Bitvector.of_int ~size:!ts_bitsize id)
-                current_state_bv
-            then name :: acc
-            else acc)
-          v_id_tbl []
-      in
-      (* TODO Est-ce la bonne manière d'intérompre l'exploration ? --> Non *)
-      let call_trace : string list =
-        List.rev @@ Path.get path ts_call_trace_key
-      in
-      TSLogger.fatal
-        "@[<v>Object %a:@ API misusage.@ Last transition:@   [%a] -- (%s) --> \
-         [%a]@ Call trace leading to this state:@   %a@]"
-        Bitvector.pp_hex obj_addr
-        (Format.pp_print_list
-           ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
-           Automaton.A.Utils.pp_vertex)
-        current_state_str name
-        (Format.pp_print_list
-           ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
-           Automaton.A.Utils.pp_vertex)
-        new_state_str
-        (Format.pp_print_list
-           ~pp_sep:(fun ppf _ -> Format.fprintf ppf " -> ")
-           Format.pp_print_string)
-        call_trace);
-    Return
-    *)
 
   let initialization_callback (path : Path.t) =
     TSLogger.info "init callback";
