@@ -135,7 +135,15 @@ module VertexTbl = struct
           Automaton.A.Utils.pp_vertex v
 end
 
-type Binsec_sse.Script.Ast.t += Def_automaton
+type edge_atom =
+  string * string * Binsec_sse.Script.Ast.Symbol.t Binsec_sse.Script.Ast.loc
+
+type Binsec_sse.Script.Ast.t += Def_automaton of (string list * edge_atom list)
+
+type Binsec_sse.Script.Ast.Obj.t +=
+  | State_list of string list
+  | Edge_atom of edge_atom
+  | Edge_list of edge_atom list
 
 type ('value, 'model, 'state, 'path, 'a) field_id +=
   | TS_call_stack :
@@ -917,17 +925,144 @@ struct
 
   (* regarder dans exec.ml ou script.ml comment c'est fait *)
   let grammar_extension =
+    let open Binsec_script in
     [
+      Dyp.Bind_to_cons
+        [
+          ("comma_separated_rev_state_list", "Obj");
+          ("states_def", "Obj");
+          ("comma_separated_rev_edge_list", "Obj");
+          ("edge_def", "Obj");
+          ("edges_def", "Obj");
+        ];
       Dyp.Add_rules
         [
-          ( ( "decl",
+          ( ( "comma_separated_rev_state_list",
+              [ Dyp.Non_ter ("ident", No_priority) ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ Syntax.String name ] -> (Syntax.Obj (State_list [ name ]), [])
+              | _ -> assert false );
+          ( ( "comma_separated_rev_state_list",
               [
-                Dyp.Regexp (RE_String "def"); Dyp.Regexp (RE_String "automaton");
+                Dyp.Non_ter ("comma_separated_rev_state_list", No_priority);
+                Dyp.Regexp (RE_Char ',');
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Non_ter ("ident", No_priority);
               ],
               "default_priority",
               [] ),
             fun _ -> function
-              | [ _; _ ] -> (Binsec_script.Syntax.Decl Def_automaton, [])
+              | [ Syntax.Obj (State_list l); _; _; Syntax.String name ] ->
+                  (Syntax.Obj (State_list (name :: l)), [])
+              | _ -> assert false );
+          ( ( "states_def",
+              [
+                Dyp.Regexp (RE_String "states");
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Non_ter ("comma_separated_rev_state_list", No_priority);
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Regexp (RE_String "end");
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ _; _; sl; _; _ ] -> (sl, [])
+              | _ -> assert false );
+          ( ( "states_def",
+              [
+                Dyp.Regexp (RE_String "states");
+                Dyp.Non_ter ("comma_separated_rev_state_list", No_priority);
+                Dyp.Non_ter ("newline", No_priority);
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function [ _; sl; _ ] -> (sl, []) | _ -> assert false );
+          ( ( "edge_def",
+              [
+                Dyp.Non_ter ("ident", No_priority);
+                Dyp.Regexp (RE_String "->");
+                Dyp.Non_ter ("ident", No_priority);
+                Dyp.Regexp (RE_Char ':');
+                Dyp.Non_ter ("symbol", No_priority);
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [
+                  Syntax.String src; _; Syntax.String dest; _; Syntax.Symbol sym;
+                ] ->
+                  (Syntax.Obj (Edge_atom (src, dest, sym)), [])
+              | _ -> assert false );
+          ( ( "comma_separated_rev_edge_list",
+              [ Dyp.Non_ter ("edge_def", No_priority) ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ Syntax.Obj (Edge_atom e) ] ->
+                  (Syntax.Obj (Edge_list [ e ]), [])
+              | _ -> assert false );
+          ( ( "comma_separated_rev_edge_list",
+              [
+                Dyp.Non_ter ("comma_separated_rev_edge_list", No_priority);
+                Dyp.Non_ter ("newline", No_priority);
+                Dyp.Non_ter ("edge_def", No_priority);
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ Syntax.Obj (Edge_list l); _; Syntax.Obj (Edge_atom e) ] ->
+                  (Syntax.Obj (Edge_list (e :: l)), [])
+              | _ -> assert false );
+          ( ( "edges_def",
+              [
+                Dyp.Regexp (RE_String "edges");
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Non_ter ("comma_separated_rev_edge_list", No_priority);
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Regexp (RE_String "end");
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ _; _; el; _; _ ] -> (el, [])
+              | _ -> assert false );
+          ( ( "decl",
+              [
+                (* automaton def *)
+                Dyp.Regexp (RE_String "def");
+                Dyp.Regexp (RE_String "automaton");
+                Dyp.Regexp (RE_String ":=");
+                Dyp.Non_ter ("accept_newline", No_priority);
+                (* states def *)
+                Dyp.Non_ter ("states_def", No_priority);
+                Dyp.Non_ter ("accept_newline", No_priority);
+                (* edges def *)
+                Dyp.Non_ter ("edges_def", No_priority);
+                Dyp.Non_ter ("accept_newline", No_priority);
+                (* end of automaton def *)
+                Dyp.Regexp (RE_String "end");
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [
+                  (* automaton def *)
+                  _;
+                  _;
+                  _;
+                  _;
+                  (* states def *)
+                  Syntax.Obj (State_list ls);
+                  _;
+                  (* edges def *)
+                  Syntax.Obj (Edge_list le);
+                  _;
+                  (* end of automaton def *)
+                  _;
+                ] ->
+                  (Syntax.Decl (Def_automaton (List.rev ls, List.rev le)), [])
               | _ -> assert false );
         ];
     ]
@@ -937,35 +1072,49 @@ struct
       Initialization_callback initialization_callback;
       Grammar_extension grammar_extension;
       Command_handler
-        (fun _ (env : Script.env) path : bool ->
-          let symbol_assoc_list =
-            Automaton.A.fold_edges_e
-              (fun e l ->
-                let e_name = Automaton.A.Utils.get_edge_name e in
-                let addr =
-                  try
-                    Bitvector.value_of
-                    @@ Path.eval path
-                         (env.lookup_symbol e_name Dba.Var.Tag.Value)
-                  with _ ->
-                    TSLogger.warning "Le symbole n'existe pas : %s" e_name;
-                    Bitvector.value_of @@ Bitvector.zero
-                in
-                let size =
-                  try
-                    Bitvector.value_of
-                    @@ Path.eval path
-                         (env.lookup_symbol e_name Dba.Var.Tag.Size)
-                  with _ ->
-                    TSLogger.warning "Le symbole %s n'a pas de taille" e_name;
-                    Bitvector.value_of @@ Bitvector.zero
-                in
-                (e_name, addr, size) :: l)
-              lb_automaton []
-          in
-          make_function_intervals symbol_assoc_list;
-          make_function_addresses symbol_assoc_list;
-          true);
+        (fun cmd (env : Script.env) path : bool ->
+          match cmd with
+          | Def_automaton (ls, le) ->
+              TSLogger.info "Read states from file : %a"
+                (Format.pp_print_list
+                   ~pp_sep:(fun ppf () -> Format.fprintf ppf ", ")
+                   Format.pp_print_string)
+                ls;
+              TSLogger.info "Read edges from file : @[<v>%a@]"
+                ( Format.pp_print_list ~pp_sep:Format.pp_print_space
+                @@ fun ppf (src, dest, ((s, _), _)) ->
+                  Format.fprintf ppf "%s -> %s : %s" src dest s )
+                le;
+              let symbol_assoc_list =
+                Automaton.A.fold_edges_e
+                  (fun e l ->
+                    let e_name = Automaton.A.Utils.get_edge_name e in
+                    let addr =
+                      try
+                        Bitvector.value_of
+                        @@ Path.eval path
+                             (env.lookup_symbol e_name Dba.Var.Tag.Value)
+                      with _ ->
+                        TSLogger.warning "Le symbole n'existe pas : %s" e_name;
+                        Bitvector.value_of @@ Bitvector.zero
+                    in
+                    let size =
+                      try
+                        Bitvector.value_of
+                        @@ Path.eval path
+                             (env.lookup_symbol e_name Dba.Var.Tag.Size)
+                      with _ ->
+                        TSLogger.warning "Le symbole %s n'a pas de taille"
+                          e_name;
+                        Bitvector.value_of @@ Bitvector.zero
+                    in
+                    (e_name, addr, size) :: l)
+                  lb_automaton []
+              in
+              make_function_intervals symbol_assoc_list;
+              make_function_addresses symbol_assoc_list;
+              true
+          | _ -> assert false);
       Fetch_hook
         {
           scope = None;
