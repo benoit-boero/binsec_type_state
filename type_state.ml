@@ -1,6 +1,8 @@
 let compose f g x = f (g x)
 
 open Binsec_sse.Types
+open Binsec_sse
+open Binsec_kernel
 
 module ID = struct
   let name = "type_state"
@@ -135,14 +137,13 @@ module VertexTbl = struct
           Automaton.A.Utils.pp_vertex v
 end
 
-type edge_atom =
-  string * string * Binsec_sse.Script.Ast.Symbol.t Binsec_sse.Script.Ast.loc
+type edge_atom = string * string * Script.Ast.Symbol.t
+type Script.Ast.t += Def_automaton of (string list * edge_atom list)
 
-type Binsec_sse.Script.Ast.t += Def_automaton of (string list * edge_atom list)
-
-type Binsec_sse.Script.Ast.Obj.t +=
+type Script.Ast.Obj.t +=
   | State_list of string list
   | Edge_atom of edge_atom
+  | Ret_arg_opt of Dba.Var.t Script.loc option
   | Edge_list of edge_atom list
 
 type ('value, 'model, 'state, 'path, 'a) field_id +=
@@ -931,8 +932,10 @@ struct
         [
           ("comma_separated_rev_state_list", "Obj");
           ("states_def", "Obj");
-          ("comma_separated_rev_edge_list", "Obj");
+          ("symbol_with_args", "Obj");
+          ("ret_argument", "Obj");
           ("edge_def", "Obj");
+          ("comma_separated_rev_edge_list", "Obj");
           ("edges_def", "Obj");
         ];
       Dyp.Add_rules
@@ -979,19 +982,36 @@ struct
               "default_priority",
               [] ),
             fun _ -> function [ _; sl; _ ] -> (sl, []) | _ -> assert false );
+          ( ("ret_argument", [], "default_priority", []),
+            fun _ _ -> (Syntax.Obj (Ret_arg_opt None), []) );
+          ( ( "ret_argument",
+              [ Dyp.Non_ter ("var", No_priority); Dyp.Regexp (RE_Char '=') ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ _; _ ] -> (Syntax.Obj (Ret_arg_opt None), [])
+              | _ -> assert false );
           ( ( "edge_def",
               [
                 Dyp.Non_ter ("ident", No_priority);
                 Dyp.Regexp (RE_String "->");
                 Dyp.Non_ter ("ident", No_priority);
                 Dyp.Regexp (RE_Char ':');
+                Dyp.Non_ter ("ret_argument", No_priority);
                 Dyp.Non_ter ("symbol", No_priority);
+                Dyp.Non_ter ("arguments", No_priority);
               ],
               "default_priority",
               [] ),
             fun _ -> function
               | [
-                  Syntax.String src; _; Syntax.String dest; _; Syntax.Symbol sym;
+                  Syntax.String src;
+                  _;
+                  Syntax.String dest;
+                  _;
+                  _ (* ret argument *);
+                  Syntax.Symbol (sym, _);
+                  _ (* arguments *);
                 ] ->
                   (Syntax.Obj (Edge_atom (src, dest, sym)), [])
               | _ -> assert false );
@@ -1082,7 +1102,7 @@ struct
                 ls;
               TSLogger.info "Read edges from file : @[<v>%a@]"
                 ( Format.pp_print_list ~pp_sep:Format.pp_print_space
-                @@ fun ppf (src, dest, ((s, _), _)) ->
+                @@ fun ppf (src, dest, (s, _)) ->
                   Format.fprintf ppf "%s -> %s : %s" src dest s )
                 le;
               let symbol_assoc_list =
