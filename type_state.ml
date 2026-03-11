@@ -2,7 +2,6 @@ let compose f g x = f (g x)
 
 open Binsec_sse.Types
 open Binsec_sse
-open Binsec_kernel
 
 module ID = struct
   let name = "type_state"
@@ -143,7 +142,10 @@ type Script.Ast.t += Def_automaton of (string list * edge_atom list)
 type Script.Ast.Obj.t +=
   | State_list of string list
   | Edge_atom of edge_atom
-  | Ret_arg_opt of Dba.Var.t Script.loc option
+  | String_opt of string option
+  | Predicate_body of Script.Expr.t Script.loc
+  | Predicate_clause of
+      (Script.Expr.t Script.loc option * Script.Expr.t Script.loc option)
   | Edge_list of edge_atom list
 
 type ('value, 'model, 'state, 'path, 'a) field_id +=
@@ -932,8 +934,10 @@ struct
         [
           ("comma_separated_rev_state_list", "Obj");
           ("states_def", "Obj");
-          ("symbol_with_args", "Obj");
+          ("edge_predicate_clauses", "Obj");
           ("ret_argument", "Obj");
+          ("object_position", "Obj");
+          ("predicate_body", "Obj");
           ("edge_def", "Obj");
           ("comma_separated_rev_edge_list", "Obj");
           ("edges_def", "Obj");
@@ -983,13 +987,145 @@ struct
               [] ),
             fun _ -> function [ _; sl; _ ] -> (sl, []) | _ -> assert false );
           ( ("ret_argument", [], "default_priority", []),
-            fun _ _ -> (Syntax.Obj (Ret_arg_opt None), []) );
+            fun _ _ -> (Syntax.Obj (String_opt None), []) );
           ( ( "ret_argument",
-              [ Dyp.Non_ter ("var", No_priority); Dyp.Regexp (RE_Char '=') ],
+              [ Dyp.Non_ter ("ident", No_priority); Dyp.Regexp (RE_Char '=') ],
               "default_priority",
               [] ),
             fun _ -> function
-              | [ _; _ ] -> (Syntax.Obj (Ret_arg_opt None), [])
+              | [ Syntax.String name; _ ] ->
+                  (Syntax.Obj (String_opt (Some name)), [])
+              | _ -> assert false );
+          ( ( "ret_argument",
+              [ Dyp.Regexp (RE_Char '_'); Dyp.Regexp (RE_Char '=') ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ _; _ ] -> (Syntax.Obj (String_opt None), [])
+              | _ -> assert false );
+          ( ("object_position", [], "default_priority", []),
+            fun _ _ -> (Syntax.Obj (String_opt None), []) );
+          ( ( "object_position",
+              [
+                Dyp.Regexp (RE_String "using");
+                Dyp.Non_ter ("ident", No_priority);
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ _; Syntax.String name ] ->
+                  (Syntax.Obj (String_opt (Some name)), [])
+              | _ -> assert false );
+          ( ( "predicate_body",
+              [ Dyp.Non_ter ("expr", No_priority) ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ Syntax.Expr expr ] -> (Syntax.Obj (Predicate_body expr), [])
+              | _ -> assert false );
+          ( ( "predicate_body",
+              [
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Non_ter ("expr", No_priority);
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Regexp (RE_String "end");
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ _; Syntax.Expr expr; _; _ ] ->
+                  (Syntax.Obj (Predicate_body expr), [])
+              | _ -> assert false );
+          ( ("edge_predicate_clauses", [], "default_priority", []),
+            fun _ _ -> (Syntax.Obj (Predicate_clause (None, None)), []) );
+          ( ( "edge_predicate_clauses",
+              [
+                Dyp.Regexp (RE_String "when");
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Regexp (RE_String "at");
+                Dyp.Regexp (RE_String "return");
+                Dyp.Regexp (RE_Char ':');
+                Dyp.Non_ter ("predicate_body", No_priority);
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Regexp (RE_String "end");
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [
+                  _;
+                  _;
+                  _;
+                  _;
+                  _;
+                  Syntax.Obj (Predicate_body expr) (* body *);
+                  _;
+                  _;
+                ] ->
+                  (Syntax.Obj (Predicate_clause (None, Some expr)), [])
+              | _ -> assert false );
+          ( ( "edge_predicate_clauses",
+              [
+                Dyp.Regexp (RE_String "when");
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Regexp (RE_String "at");
+                Dyp.Regexp (RE_String "call");
+                Dyp.Regexp (RE_Char ':');
+                Dyp.Non_ter ("predicate_body", No_priority);
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Regexp (RE_String "end");
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [
+                  _;
+                  _;
+                  _;
+                  _;
+                  _;
+                  Syntax.Obj (Predicate_body expr) (* body *);
+                  _;
+                  _;
+                ] ->
+                  (Syntax.Obj (Predicate_clause (Some expr, None)), [])
+              | _ -> assert false );
+          ( ( "edge_predicate_clauses",
+              [
+                Dyp.Regexp (RE_String "when");
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Regexp (RE_String "at");
+                Dyp.Regexp (RE_String "call");
+                Dyp.Regexp (RE_Char ':');
+                Dyp.Non_ter ("predicate_body", No_priority);
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Regexp (RE_String "at");
+                Dyp.Regexp (RE_String "return");
+                Dyp.Regexp (RE_Char ':');
+                Dyp.Non_ter ("predicate_body", No_priority);
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Regexp (RE_String "end");
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [
+                  _;
+                  _;
+                  _;
+                  _;
+                  _;
+                  Syntax.Obj (Predicate_body call_expr);
+                  _;
+                  _;
+                  _;
+                  _;
+                  Syntax.Obj (Predicate_body ret_expr);
+                  _;
+                  _;
+                ] ->
+                  ( Syntax.Obj (Predicate_clause (Some call_expr, Some ret_expr)),
+                    [] )
               | _ -> assert false );
           ( ( "edge_def",
               [
@@ -1000,6 +1136,10 @@ struct
                 Dyp.Non_ter ("ret_argument", No_priority);
                 Dyp.Non_ter ("symbol", No_priority);
                 Dyp.Non_ter ("arguments", No_priority);
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Non_ter ("object_position", No_priority);
+                Dyp.Non_ter ("accept_newline", No_priority);
+                Dyp.Non_ter ("edge_predicate_clauses", No_priority);
               ],
               "default_priority",
               [] ),
@@ -1012,6 +1152,10 @@ struct
                   _ (* ret argument *);
                   Syntax.Symbol (sym, _);
                   _ (* arguments *);
+                  _;
+                  _ (*Object position *);
+                  _;
+                  _ (* edge predicate clause *);
                 ] ->
                   (Syntax.Obj (Edge_atom (src, dest, sym)), [])
               | _ -> assert false );
