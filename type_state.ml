@@ -136,15 +136,37 @@ module VertexTbl = struct
           Automaton.A.Utils.pp_vertex v
 end
 
-type edge_atom = string * string * Script.Ast.Symbol.t
-type Script.Ast.t += Def_automaton of (string list * edge_atom list)
+(*
+    Dyp.Non_ter ("ident", No_priority);
+    Dyp.Regexp (RE_String "->");
+    Dyp.Non_ter ("ident", No_priority);
+    Dyp.Regexp (RE_Char ':');
+    Dyp.Non_ter ("ret_argument", No_priority);
+    Dyp.Non_ter ("symbol", No_priority);
+    Dyp.Non_ter ("arguments", No_priority);
+    Dyp.Non_ter ("accept_newline", No_priority);
+    Dyp.Non_ter ("object_position", No_priority);
+    Dyp.Non_ter ("accept_newline", No_priority);
+    Dyp.Non_ter ("edge_predicate_clauses", No_priority);
+*)
+
+type edge_atom =
+  string (* src vertex *)
+  * string (* dest vertex *)
+  * Script.Ast.Symbol.t (* symbol *)
+  * string option (* ret argument *)
+  * Script.Ast.Instr.t list (* arguments *)
+  * Script.Expr.t Script.loc option (* object position *)
+  * (Script.Expr.t Script.loc option * Script.Expr.t Script.loc option)
+
+type Script.Ast.t += Def_automaton of (string * string list * edge_atom list)
 
 type Script.Ast.Obj.t +=
   | State_list of string list
   | Edge_atom of edge_atom
   | String_opt of string option
-  | Predicate_body of Script.Expr.t Script.loc
-  | Predicate_clause of
+  | Predicate of Script.Expr.t Script.loc
+  | Predicates of
       (Script.Expr.t Script.loc option * Script.Expr.t Script.loc option)
   | Edge_list of edge_atom list
 
@@ -1004,24 +1026,23 @@ struct
               | [ _; _ ] -> (Syntax.Obj (String_opt None), [])
               | _ -> assert false );
           ( ("object_position", [], "default_priority", []),
-            fun _ _ -> (Syntax.Obj (String_opt None), []) );
+            fun _ _ -> (Syntax.Obj (Script.Expr_opt None), []) );
           ( ( "object_position",
               [
-                Dyp.Regexp (RE_String "using");
-                Dyp.Non_ter ("ident", No_priority);
+                Dyp.Regexp (RE_String "using"); Dyp.Non_ter ("expr", No_priority);
               ],
               "default_priority",
               [] ),
             fun _ -> function
-              | [ _; Syntax.String name ] ->
-                  (Syntax.Obj (String_opt (Some name)), [])
+              | [ _; Syntax.Expr name ] ->
+                  (Syntax.Obj (Script.Expr_opt (Some name)), [])
               | _ -> assert false );
           ( ( "predicate_body",
               [ Dyp.Non_ter ("expr", No_priority) ],
               "default_priority",
               [] ),
             fun _ -> function
-              | [ Syntax.Expr expr ] -> (Syntax.Obj (Predicate_body expr), [])
+              | [ Syntax.Expr expr ] -> (Syntax.Obj (Predicate expr), [])
               | _ -> assert false );
           ( ( "predicate_body",
               [
@@ -1034,10 +1055,10 @@ struct
               [] ),
             fun _ -> function
               | [ _; Syntax.Expr expr; _; _ ] ->
-                  (Syntax.Obj (Predicate_body expr), [])
+                  (Syntax.Obj (Predicate expr), [])
               | _ -> assert false );
           ( ("edge_predicate_clauses", [], "default_priority", []),
-            fun _ _ -> (Syntax.Obj (Predicate_clause (None, None)), []) );
+            fun _ _ -> (Syntax.Obj (Predicates (None, None)), []) );
           ( ( "edge_predicate_clauses",
               [
                 Dyp.Regexp (RE_String "when");
@@ -1052,17 +1073,9 @@ struct
               "default_priority",
               [] ),
             fun _ -> function
-              | [
-                  _;
-                  _;
-                  _;
-                  _;
-                  _;
-                  Syntax.Obj (Predicate_body expr) (* body *);
-                  _;
-                  _;
-                ] ->
-                  (Syntax.Obj (Predicate_clause (None, Some expr)), [])
+              | [ _; _; _; _; _; Syntax.Obj (Predicate expr) (* body *); _; _ ]
+                ->
+                  (Syntax.Obj (Predicates (None, Some expr)), [])
               | _ -> assert false );
           ( ( "edge_predicate_clauses",
               [
@@ -1078,17 +1091,9 @@ struct
               "default_priority",
               [] ),
             fun _ -> function
-              | [
-                  _;
-                  _;
-                  _;
-                  _;
-                  _;
-                  Syntax.Obj (Predicate_body expr) (* body *);
-                  _;
-                  _;
-                ] ->
-                  (Syntax.Obj (Predicate_clause (Some expr, None)), [])
+              | [ _; _; _; _; _; Syntax.Obj (Predicate expr) (* body *); _; _ ]
+                ->
+                  (Syntax.Obj (Predicates (Some expr, None)), [])
               | _ -> assert false );
           ( ( "edge_predicate_clauses",
               [
@@ -1115,17 +1120,16 @@ struct
                   _;
                   _;
                   _;
-                  Syntax.Obj (Predicate_body call_expr);
+                  Syntax.Obj (Predicate call_expr);
                   _;
                   _;
                   _;
                   _;
-                  Syntax.Obj (Predicate_body ret_expr);
+                  Syntax.Obj (Predicate ret_expr);
                   _;
                   _;
                 ] ->
-                  ( Syntax.Obj (Predicate_clause (Some call_expr, Some ret_expr)),
-                    [] )
+                  (Syntax.Obj (Predicates (Some call_expr, Some ret_expr)), [])
               | _ -> assert false );
           ( ( "edge_def",
               [
@@ -1149,15 +1153,18 @@ struct
                   _;
                   Syntax.String dest;
                   _;
-                  _ (* ret argument *);
+                  Syntax.Obj (String_opt ret_arg) (* ret argument *);
                   Syntax.Symbol (sym, _);
-                  _ (* arguments *);
+                  Syntax.Stmt args (* arguments *);
                   _;
-                  _ (*Object position *);
+                  Syntax.Obj (Script.Expr_opt obj_loc) (*Object position *);
                   _;
-                  _ (* edge predicate clause *);
+                  Syntax.Obj (Predicates predicates) (* edge predicate clause *);
                 ] ->
-                  (Syntax.Obj (Edge_atom (src, dest, sym)), [])
+                  ( Syntax.Obj
+                      (Edge_atom
+                         (src, dest, sym, ret_arg, args, obj_loc, predicates)),
+                    [] )
               | _ -> assert false );
           ( ( "comma_separated_rev_edge_list",
               [ Dyp.Non_ter ("edge_def", No_priority) ],
@@ -1197,6 +1204,7 @@ struct
                 (* automaton def *)
                 Dyp.Regexp (RE_String "def");
                 Dyp.Regexp (RE_String "automaton");
+                Dyp.Non_ter ("ident", No_priority);
                 Dyp.Regexp (RE_String ":=");
                 Dyp.Non_ter ("accept_newline", No_priority);
                 (* states def *)
@@ -1215,6 +1223,7 @@ struct
                   (* automaton def *)
                   _;
                   _;
+                  Syntax.String name (* automaton name *);
                   _;
                   _;
                   (* states def *)
@@ -1226,10 +1235,15 @@ struct
                   (* end of automaton def *)
                   _;
                 ] ->
-                  (Syntax.Decl (Def_automaton (List.rev ls, List.rev le)), [])
+                  ( Syntax.Decl (Def_automaton (name, List.rev ls, List.rev le)),
+                    [] )
               | _ -> assert false );
         ];
     ]
+
+  let build_automaton_from_script_definition (_ : string) (_ : string list)
+      (_ : edge_atom list) : unit =
+    ()
 
   let list =
     [
@@ -1238,17 +1252,8 @@ struct
       Command_handler
         (fun cmd (env : Script.env) path : bool ->
           match cmd with
-          | Def_automaton (ls, le) ->
-              TSLogger.info "Read states from file : %a"
-                (Format.pp_print_list
-                   ~pp_sep:(fun ppf () -> Format.fprintf ppf ", ")
-                   Format.pp_print_string)
-                ls;
-              TSLogger.info "Read edges from file : @[<v>%a@]"
-                ( Format.pp_print_list ~pp_sep:Format.pp_print_space
-                @@ fun ppf (src, dest, (s, _)) ->
-                  Format.fprintf ppf "%s -> %s : %s" src dest s )
-                le;
+          | Def_automaton (name, ls, le) ->
+              build_automaton_from_script_definition name ls le;
               let symbol_assoc_list =
                 Automaton.A.fold_edges_e
                   (fun e l ->
