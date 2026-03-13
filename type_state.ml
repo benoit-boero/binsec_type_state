@@ -1175,66 +1175,6 @@ struct
               | _ -> assert false );
         ];
     ]
-  (*
-
-let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
-  let open Binsec_kernel in
-  let module MyIsaHelper = (val Isa_helper.get arch) in
-  let rax = Dba.LValue.to_expr @@ MyIsaHelper.get_ret () in
-  let vrai = Dba.Expr.one in
-  let faux = Dba.Expr.zeros (Dba.Expr.size_of rax) in
-  (* Vertexes *)
-  let nv = Automaton.A.V.create in
-  let bottom = nv Bottom in
-  let off_ok = nv @@ Ok "off ok" in
-  let off_broken = nv @@ Ok "off broken" in
-  let on_ok = nv @@ Ok "on ok" in
-  let on_broken = nv @@ Ok "on broken" in
-  (* Edges *)
-  let ne = Automaton.A.E.create in
-  let buy = ne bottom ("buy", vrai, vrai, Return rax) off_ok in
-  let arg1 = MyIsaHelper.get_arg 0 in
-  let nev e s e' = Automaton.A.E.create e (s, vrai, vrai, Call arg1) e' in
-  let recycle_ok = nev off_ok "recycle" bottom in
-  let recycle_broken = nev off_broken "recycle" bottom in
-  let turn_on_ok_ok = nev off_ok "turn_on" on_ok in
-  let turn_on_ok_broken = nev off_ok "turn_on" on_broken in
-  let turn_off_ok = nev on_ok "turn_off" off_ok in
-  let turn_off_broken = nev on_broken "turn_off" off_broken in
-  let is_dead_on_ok =
-    ne on_ok ("is_dead", vrai, Dba.Expr.equal rax faux, Call arg1) on_ok
-  in
-  let is_dead_on_broken =
-    ne on_broken ("is_dead", vrai, Dba.Expr.diff rax faux, Call arg1) on_broken
-  in
-  let is_dead_off_ok =
-    ne off_ok ("is_dead", vrai, Dba.Expr.equal rax faux, Call arg1) off_ok
-  in
-  let is_dead_off_broken =
-    ne off_broken
-      ("is_dead", vrai, Dba.Expr.diff rax faux, Call arg1)
-      off_broken
-  in
-  (* automaton *)
-  let av = Automaton.A.add_vertex lb_automaton in
-  let ae = Automaton.A.add_edge_e lb_automaton in
-  List.iter (fun v -> av v) [ bottom; off_ok; off_broken; on_ok; on_broken ];
-  List.iter
-    (fun e -> ae e)
-    [
-      buy;
-      recycle_ok;
-      recycle_broken;
-      turn_on_ok_ok;
-      turn_on_ok_broken;
-      turn_off_ok;
-      turn_off_broken;
-      is_dead_on_ok;
-      is_dead_on_broken;
-      is_dead_off_ok;
-      is_dead_off_broken;
-    ]
-*)
 
   (** Builds an automaton (Automaton.A.t) using the information returned by the script parser. *)
 
