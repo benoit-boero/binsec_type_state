@@ -1,5 +1,11 @@
 let compose f g x = f (g x)
 
+(*
+TODO
+Look quickly into valgring / else to find a cool example of the use of a typestate.
+
+*)
+
 open Binsec_sse.Types
 open Binsec_sse
 
@@ -136,19 +142,10 @@ module VertexTbl = struct
           Automaton.A.Utils.pp_vertex v
 end
 
-(*
-    Dyp.Non_ter ("ident", No_priority);
-    Dyp.Regexp (RE_String "->");
-    Dyp.Non_ter ("ident", No_priority);
-    Dyp.Regexp (RE_Char ':');
-    Dyp.Non_ter ("ret_argument", No_priority);
-    Dyp.Non_ter ("symbol", No_priority);
-    Dyp.Non_ter ("arguments", No_priority);
-    Dyp.Non_ter ("accept_newline", No_priority);
-    Dyp.Non_ter ("object_position", No_priority);
-    Dyp.Non_ter ("accept_newline", No_priority);
-    Dyp.Non_ter ("edge_predicate_clauses", No_priority);
-*)
+type script_eval_pt =
+  | IsCall of Script.Expr.t Script.loc
+  | IsReturn of Script.Expr.t Script.loc
+  | IsNone
 
 type edge_atom =
   string (* src vertex *)
@@ -156,13 +153,14 @@ type edge_atom =
   * Script.Ast.Symbol.t (* symbol *)
   * string option (* ret argument *)
   * Script.Ast.Instr.t list (* arguments *)
-  * Script.Expr.t Script.loc option (* object position *)
+  * script_eval_pt (* object position *)
   * (Script.Expr.t Script.loc option * Script.Expr.t Script.loc option)
 
 type Script.Ast.t += Def_automaton of (string * string list * edge_atom list)
 
 type Script.Ast.Obj.t +=
   | State_list of string list
+  | Eval_pt of script_eval_pt
   | Edge_atom of edge_atom
   | String_opt of string option
   | Predicate of Script.Expr.t Script.loc
@@ -200,7 +198,7 @@ type ('value, 'model, 'state, 'path, 'a) field_id +=
         'value Binsec_kernel.Bitvector.Map.t )
       field_id
 
-let lb_automaton = Automaton.A.create ()
+let lb_automaton = ref @@ Automaton.A.create ()
 
 let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
   let open Binsec_kernel in
@@ -241,8 +239,8 @@ let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
       off_broken
   in
   (* automaton *)
-  let av = Automaton.A.add_vertex lb_automaton in
-  let ae = Automaton.A.add_edge_e lb_automaton in
+  let av = Automaton.A.add_vertex !lb_automaton in
+  let ae = Automaton.A.add_edge_e !lb_automaton in
   List.iter (fun v -> av v) [ bottom; off_ok; off_broken; on_ok; on_broken ];
   List.iter
     (fun e -> ae e)
@@ -928,14 +926,18 @@ struct
       if m_process = Return then construct_object c_list else m_process
     else d_process
 
-  let initialization_callback (path : Path.t) =
+  let initialization_callback (_ : Path.t) =
     TSLogger.info "init callback";
-    (* Make automaton *)
+    ()
+
+  (* Make automaton *)
+  (*
     make_lb_automaton Engine.isa;
     (* Complete automaton *)
-    add_impossible_and_error_states lb_automaton path;
+    add_impossible_and_error_states !lb_automaton path;
+    ()
     (* Make state identifiers *)
-    make_v_id_tbl lb_automaton v_id_tbl;
+    make_v_id_tbl !lb_automaton v_id_tbl;
     (* Init type state bitsize *)
     ts_bitsize :=
       int_of_float
@@ -946,7 +948,8 @@ struct
       Automaton.A.fold_vertex
         (fun v acc ->
           match v with Error _ | Automaton.ErrorDefault -> v :: acc | _ -> acc)
-        lb_automaton []
+        !lb_automaton []
+*)
 
   (* regarder dans exec.ml ou script.ml comment c'est fait *)
   let grammar_extension =
@@ -1026,16 +1029,32 @@ struct
               | [ _; _ ] -> (Syntax.Obj (String_opt None), [])
               | _ -> assert false );
           ( ("object_position", [], "default_priority", []),
-            fun _ _ -> (Syntax.Obj (Script.Expr_opt None), []) );
+            fun _ _ -> (Syntax.Obj (Eval_pt IsNone), []) );
           ( ( "object_position",
               [
-                Dyp.Regexp (RE_String "using"); Dyp.Non_ter ("expr", No_priority);
+                Dyp.Regexp (RE_String "using");
+                Dyp.Non_ter ("expr", No_priority);
+                Dyp.Regexp (RE_String "at");
+                Dyp.Regexp (RE_String "call");
               ],
               "default_priority",
               [] ),
             fun _ -> function
-              | [ _; Syntax.Expr name ] ->
-                  (Syntax.Obj (Script.Expr_opt (Some name)), [])
+              | [ _; Syntax.Expr name; _; _ ] ->
+                  (Syntax.Obj (Eval_pt (IsCall name)), [])
+              | _ -> assert false );
+          ( ( "object_position",
+              [
+                Dyp.Regexp (RE_String "using");
+                Dyp.Non_ter ("expr", No_priority);
+                Dyp.Regexp (RE_String "at");
+                Dyp.Regexp (RE_String "return");
+              ],
+              "default_priority",
+              [] ),
+            fun _ -> function
+              | [ _; Syntax.Expr name; _; _ ] ->
+                  (Syntax.Obj (Eval_pt (IsReturn name)), [])
               | _ -> assert false );
           ( ( "predicate_body",
               [ Dyp.Non_ter ("expr", No_priority) ],
@@ -1157,7 +1176,7 @@ struct
                   Syntax.Symbol (sym, _);
                   Syntax.Stmt args (* arguments *);
                   _;
-                  Syntax.Obj (Script.Expr_opt obj_loc) (*Object position *);
+                  Syntax.Obj (Eval_pt obj_loc) (*Object position *);
                   _;
                   Syntax.Obj (Predicates predicates) (* edge predicate clause *);
                 ] ->
@@ -1240,12 +1259,225 @@ struct
               | _ -> assert false );
         ];
     ]
+  (*
 
-  let build_automaton_from_script_definition (_ : string) (_ : string list)
-      (_ : edge_atom list) : unit =
-    ()
+let make_lb_automaton (arch : Binsec_kernel.Machine.t) : unit =
+  let open Binsec_kernel in
+  let module MyIsaHelper = (val Isa_helper.get arch) in
+  let rax = Dba.LValue.to_expr @@ MyIsaHelper.get_ret () in
+  let vrai = Dba.Expr.one in
+  let faux = Dba.Expr.zeros (Dba.Expr.size_of rax) in
+  (* Vertexes *)
+  let nv = Automaton.A.V.create in
+  let bottom = nv Bottom in
+  let off_ok = nv @@ Ok "off ok" in
+  let off_broken = nv @@ Ok "off broken" in
+  let on_ok = nv @@ Ok "on ok" in
+  let on_broken = nv @@ Ok "on broken" in
+  (* Edges *)
+  let ne = Automaton.A.E.create in
+  let buy = ne bottom ("buy", vrai, vrai, Return rax) off_ok in
+  let arg1 = MyIsaHelper.get_arg 0 in
+  let nev e s e' = Automaton.A.E.create e (s, vrai, vrai, Call arg1) e' in
+  let recycle_ok = nev off_ok "recycle" bottom in
+  let recycle_broken = nev off_broken "recycle" bottom in
+  let turn_on_ok_ok = nev off_ok "turn_on" on_ok in
+  let turn_on_ok_broken = nev off_ok "turn_on" on_broken in
+  let turn_off_ok = nev on_ok "turn_off" off_ok in
+  let turn_off_broken = nev on_broken "turn_off" off_broken in
+  let is_dead_on_ok =
+    ne on_ok ("is_dead", vrai, Dba.Expr.equal rax faux, Call arg1) on_ok
+  in
+  let is_dead_on_broken =
+    ne on_broken ("is_dead", vrai, Dba.Expr.diff rax faux, Call arg1) on_broken
+  in
+  let is_dead_off_ok =
+    ne off_ok ("is_dead", vrai, Dba.Expr.equal rax faux, Call arg1) off_ok
+  in
+  let is_dead_off_broken =
+    ne off_broken
+      ("is_dead", vrai, Dba.Expr.diff rax faux, Call arg1)
+      off_broken
+  in
+  (* automaton *)
+  let av = Automaton.A.add_vertex lb_automaton in
+  let ae = Automaton.A.add_edge_e lb_automaton in
+  List.iter (fun v -> av v) [ bottom; off_ok; off_broken; on_ok; on_broken ];
+  List.iter
+    (fun e -> ae e)
+    [
+      buy;
+      recycle_ok;
+      recycle_broken;
+      turn_on_ok_ok;
+      turn_on_ok_broken;
+      turn_off_ok;
+      turn_off_broken;
+      is_dead_on_ok;
+      is_dead_on_broken;
+      is_dead_off_ok;
+      is_dead_off_broken;
+    ]
+*)
+
+  (** Builds an automaton (Automaton.A.t) using the information returned by the script parser. *)
+
+  let build_automaton_from_script_definition (env : Script.env) (name : string)
+      (ls : string list) (le : edge_atom list) : unit =
+    let report_error (msg : string) =
+      TSLogger.warning "Fatal error in the definition of automaton %s:" name;
+      TSLogger.fatal "%s" msg
+    in
+    (* automaton init *)
+    let automaton = Automaton.A.create ~size:(List.length ls) () in
+    (* vertex of string *)
+    (* TODO refactor *)
+    let vertex_of_string_check name =
+      if String.lowercase_ascii name = "bottom" then
+        report_error "cannot redefine bottom state."
+      else if String.lowercase_ascii name = "errordefault" then
+        report_error "cannot redefine default error state"
+      else if String.sub (String.lowercase_ascii name) 0 5 = "error" then
+        Automaton.A.V.create (Automaton.Error name)
+      else Automaton.A.V.create (Automaton.Ok name)
+    in
+    let vertex_of_string name =
+      if String.lowercase_ascii name = "bottom" then
+        Automaton.A.V.create Automaton.Bottom
+      else if String.lowercase_ascii name = "errordefault" then
+        Automaton.A.V.create Automaton.ErrorDefault
+      else if String.sub (String.lowercase_ascii name) 0 5 = "error" then
+        Automaton.A.V.create (Automaton.Error name)
+      else Automaton.A.V.create (Automaton.Ok name)
+    in
+    (* verteces init *)
+    let _ =
+      List.iter (fun v -> Automaton.A.add_vertex automaton v)
+      @@ List.map vertex_of_string_check ls
+      (* build edge atom *)
+    in
+    let make_edge_from_edge_atom (a : edge_atom) : Automaton.A.E.t =
+      let src, dest, sym, ret_arg, args, obj_pos, predicates = a in
+      let check_state_is_valid state =
+        if
+          String.lowercase_ascii state = "bottom"
+          || String.lowercase_ascii state = "errordefault"
+        then true
+        else List.exists (fun s' -> String.equal state s') ls
+      in
+      if not (check_state_is_valid src && check_state_is_valid dest) then
+        report_error
+        @@ Format.sprintf
+             "the edge %s -> %s is using a state that has not been defined \
+              previously."
+             src dest
+      else
+        (* src and dest *)
+        let source = vertex_of_string src in
+        let destination = vertex_of_string dest in
+        let module MyIsaHelper = (val Isa_helper.get Engine.isa) in
+        let open Dba_types in
+        let substitution_map =
+          Option.fold ~none:Var.Map.empty
+            ~some:(fun name ->
+              let ret = Dba.LValue.to_expr @@ MyIsaHelper.get_ret () in
+              (* TODO refactor *)
+              let var =
+                Dba.Var.create name
+                  ~bitsize:(Size.Bit.create @@ Dba.Expr.size_of ret)
+                  ~tag:Dba.Var.Tag.Temp
+              in
+
+              env.define var Lexing.dummy_pos;
+              Var.Map.singleton var ret)
+            ret_arg
+        in
+        let substitution_map =
+          (*
+            TODO it is not safe to do the substitution, 
+            making a copy and evaluating at call/return would be safer.
+          *)
+          List.fold_left
+            (fun map arg ->
+              match arg with
+              | Script.Argument ((Var (name, _), loc), i) ->
+                  let arg = MyIsaHelper.get_arg i in
+                  let var =
+                    Dba.Var.create name
+                      ~bitsize:(Size.Bit.create @@ Dba.Expr.size_of arg)
+                      ~tag:Dba.Var.Tag.Temp
+                  in
+                  env.define var loc;
+                  Var.Map.singleton var arg
+              | _ -> map)
+            substitution_map args
+        in
+        (*
+        (* ret ack *)
+        Option.iter
+          (function
+            | x ->
+                let ret = Dba.LValue.to_expr @@ MyIsaHelper.get_ret () in
+                let var =
+                  Dba.Var.create x
+                    ~bitsize:(Size.Bit.create @@ Dba.Expr.size_of ret)
+                    ~tag:Dba.Var.Tag.Temp
+                in
+                ignore @@ Path.assign path var ret)
+          ret_arg;
+        (* args ack *)
+        List.iter
+          (function
+            | Script.Argument (e, i) ->
+                let arg = MyIsaHelper.get_arg i in
+                ignore @@ Path.assume path @@ Dba.Expr.equal arg
+                @@ Dba.LValue.to_expr @@ Script.eval_loc e env
+            | _ -> ())
+          args;
+          *)
+        (* object position *)
+        let obj_position =
+          match obj_pos with
+          | IsCall e ->
+              Automaton.Call
+                (Expr.substitute substitution_map @@ Script.eval_expr e env)
+          | IsReturn e ->
+              Automaton.Return
+                (Expr.substitute substitution_map @@ Script.eval_expr e env)
+          | IsNone ->
+              TSLogger.warning
+                "No object position provided. Defaulting to first arg.";
+              Automaton.Call (MyIsaHelper.get_arg 0)
+        in
+        (* symbol name *)
+        let symbol_name, _ = sym in
+        (* predicates *)
+        let lp, rp = predicates in
+        let p_to_exp p =
+          Option.fold ~none:Dba.Expr.one
+            ~some:(fun e ->
+              Expr.substitute substitution_map @@ Script.eval_expr e env)
+            p
+        in
+        let call_predicate = p_to_exp lp in
+        let ret_predicate = p_to_exp rp in
+        let label =
+          (symbol_name, call_predicate, ret_predicate, obj_position)
+        in
+        Automaton.A.E.create source label destination
+      (* Edges init *)
+    in
+    let _ =
+      List.iter (fun e -> Automaton.A.add_edge_e automaton e)
+      @@ List.map make_edge_from_edge_atom le
+    in
+    lb_automaton := automaton
 
   let list =
+    (*
+       au signal callback, vérifier que si le path se termine avec autre chose qu'un erreur,
+       la map d'objet suivi doit être vide.
+    *)
     [
       Initialization_callback initialization_callback;
       Grammar_extension grammar_extension;
@@ -1253,7 +1485,26 @@ struct
         (fun cmd (env : Script.env) path : bool ->
           match cmd with
           | Def_automaton (name, ls, le) ->
-              build_automaton_from_script_definition name ls le;
+              build_automaton_from_script_definition env name ls le;
+              (* Complete automaton *)
+              add_impossible_and_error_states !lb_automaton path;
+              (* Make state identifiers *)
+              make_v_id_tbl !lb_automaton v_id_tbl;
+              (* Init type state bitsize *)
+              ts_bitsize :=
+                int_of_float
+                @@ 1.
+                   +. (log @@ float_of_int @@ VertexTbl.length v_id_tbl)
+                      /. log 2.;
+              TSLogger.debug ~level:4 "Type State Bitsize: %d" !ts_bitsize;
+              (* Compute list of all error states *)
+              user_errors :=
+                Automaton.A.fold_vertex
+                  (fun v acc ->
+                    match v with
+                    | Error _ | Automaton.ErrorDefault -> v :: acc
+                    | _ -> acc)
+                  !lb_automaton [];
               let symbol_assoc_list =
                 Automaton.A.fold_edges_e
                   (fun e l ->
@@ -1278,7 +1529,7 @@ struct
                         Bitvector.value_of @@ Bitvector.zero
                     in
                     (e_name, addr, size) :: l)
-                  lb_automaton []
+                  !lb_automaton []
               in
               make_function_intervals symbol_assoc_list;
               make_function_addresses symbol_assoc_list;
@@ -1308,7 +1559,7 @@ struct
                             (c, e :: d, m)
                           else (c, d, e :: m)
                         else acc)
-                      lb_automaton ([], [], [])
+                      !lb_automaton ([], [], [])
                   in
                   TSLogger.debug ~level:1 "Inserting call hook for %s" elt;
                   Option.some
