@@ -353,7 +353,7 @@ struct
              t []
       in
       (* Adding missing functions as error transitions. *)
-      TSLogger.debug ~level:1 "Completing vertex with:";
+      TSLogger.debug ~level:2 "Completing vertex with:";
       eflist
       |> List.iter (fun name ->
              let vrai = Dba.Expr.constant Bitvector.one in
@@ -365,7 +365,7 @@ struct
                |> List.iter (fun loc ->
                       let label = (name, vrai, vrai, loc) in
                       let edge = E.create v label default_error_state in
-                      TSLogger.debug ~level:3 "@[<v>\t@[<v>* %a@]@]"
+                      TSLogger.debug ~level:2 "@[<v>\t@[<v>* %a@]@]"
                         Utils.pp_edge edge;
                       add_edge_e t edge));
       let loc_equal (p : Automaton.eval_pt) (p' : Automaton.eval_pt) =
@@ -517,7 +517,11 @@ struct
           let bmap = Path.enumerate path ~n:2 dba in
           if Bitvector.Map.cardinal bmap = 1 then
             Option.some @@ List.hd @@ Bitvector.Map.keys bmap
-          else None
+          else (
+            TSLogger.debug ~level:5 "Possible addresses: %a"
+              (Format.pp_print_list Bitvector.pp_hex)
+            @@ Bitvector.Map.keys bmap;
+            None)
     in
     (* Filter based on call predicate and start state *)
     let filter (e : Automaton.A.E.t) (state : Path.value) : bool =
@@ -566,10 +570,15 @@ struct
                     TSLogger.warning "%s: Called with untracked object." name;
                     inspect_filter [] false)
             | None ->
-                let _, (_, p, _, _), _ = t in
-                if filter_sat path @@ Path.get_value path p then (
-                  TSLogger.warning "%s: Called with symbolic or null object."
-                    name;
+                let _, (_, p, _, _), v' = t in
+                if
+                  (* TODO check that it is necessary to check that it is not impossible *)
+                  (filter_sat path @@ Path.get_value path p)
+                  && v' <> Automaton.A.V.create Automaton.Impossible
+                then (
+                  TSLogger.warning
+                    "%s: Called with symbolic or null object. (%a)" name
+                    Automaton.A.Utils.pp_edge t;
                   inspect_filter [] false)
                 else inspect_filter q true)
       else ([], false)
@@ -590,8 +599,14 @@ struct
              loc_equal && Bitvector.equal b b')
       @@ List.to_seq l
     in
-    let f_d_list = inspect_filter d_list true in
-    let f_m_list = inspect_filter m_list true in
+    let f_d_list =
+      TSLogger.debug ~level:4 "Inspect filter destructors";
+      inspect_filter d_list true
+    in
+    let f_m_list =
+      TSLogger.debug ~level:4 "Inspect filter methods";
+      inspect_filter m_list true
+    in
     match (f_d_list, f_m_list) with
     | (_, false), _ | _, (_, false) ->
         TSLogger.warning "API misusage.";
@@ -736,88 +751,91 @@ struct
                 TSLogger.warning "Impossible state cannot be avoided.";
                 Signal Cut
             | Some _ ->
-                (* Check if we can be on any error state. *)
-                let default_error_state_v =
-                  Path.State.Value.constant
-                  @@ Bitvector.of_int ~size:!ts_bitsize
-                  @@ VertexTbl.find_match v_id_tbl default_error_state
-                in
-                let predicate =
-                  List.fold_right
-                    (fun x acc ->
-                      Path.State.Value.binary Symbolic.State.Or acc
-                      @@ Path.State.Value.binary Symbolic.State.Eq new_state
-                      @@ Path.State.Value.constant
-                      @@ Bitvector.of_int ~size:!ts_bitsize
-                      @@ VertexTbl.find_match v_id_tbl x)
-                    !user_errors
-                  @@ Path.State.Value.binary Symbolic.State.Eq new_state
-                       default_error_state_v
-                in
-                if filter_sat path predicate then (
-                  let new_state_bv =
-                    Bitvector.Map.keys @@ Path.enumerate_v path new_state
-                  in
-                  TSLogger.debug ~level:4 "Length : %d BV: %a"
-                    (List.length new_state_bv)
-                    (Format.pp_print_list Bitvector.pp)
-                    new_state_bv;
-                  let new_state_str =
-                    VertexTbl.fold
-                      (fun name id acc ->
-                        if
-                          List.exists
-                            (fun bv ->
-                              Bitvector.equal bv
-                              @@ Bitvector.of_int ~size:!ts_bitsize id)
-                            new_state_bv
-                        then name :: acc
-                        else acc)
-                      v_id_tbl []
-                  in
-                  let current_state_str =
-                    state_str_of_state_value path curr_state
-                  in
-                  let call_trace : string list =
-                    List.rev
-                    @@
-                    match
-                      Bitvector.Map.find_opt addr
-                      @@ Path.get path ts_call_trace_key
-                    with
-                    | Some l -> l
-                    | None -> [ name ]
-                  in
-                  TSLogger.warning
-                    "@[<v>Object %a:@ API misusage.@ Last transition:@   [%a] \
-                     -- (%s) --> [%a]@ Call trace leading to this state:@   %a \
-                     --> %s@]"
-                    Bitvector.pp_hex addr
-                    (Format.pp_print_list
-                       ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
-                       Automaton.A.Utils.pp_vertex)
-                    current_state_str name
-                    (Format.pp_print_list
-                       ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
-                       Automaton.A.Utils.pp_vertex)
-                    new_state_str
-                    (Format.pp_print_list
-                       ~pp_sep:(fun ppf _ -> Format.fprintf ppf " -> ")
-                       Format.pp_print_string)
-                    call_trace name;
-                  Signal Cut)
-                else (
-                  (* update call trace for that object. *)
-                  TSLogger.debug ~level:3
-                    "%s: Updating call trace for object %a" name
+                (* If we were returned to Bottom we stop following the object. *)
+                let new_state_str = state_str_of_state_value path new_state in
+                if
+                  List.length new_state_str = 1
+                  && List.hd new_state_str = Bottom
+                then (
+                  TSLogger.debug ~level:0 "Object %a returned to bottom"
                     Bitvector.pp_hex addr;
-                  let map = Path.get path ts_call_trace_key in
-                  let lo = Bitvector.Map.find_opt addr map in
-                  Path.set path ts_call_trace_key
-                  @@ Bitvector.Map.add addr
-                       (match lo with Some l -> name :: l | None -> [ name ])
-                       map;
-                  Return))
+                  let objmap =
+                    Bitvector.Map.remove addr @@ Path.get path ts_state_key
+                  in
+                  Path.set path ts_state_key objmap;
+                  Return)
+                else
+                  (* Check if we can be on any error state. *)
+                  let default_error_state_v =
+                    Path.State.Value.constant
+                    @@ Bitvector.of_int ~size:!ts_bitsize
+                    @@ VertexTbl.find_match v_id_tbl default_error_state
+                  in
+                  let predicate =
+                    List.fold_right
+                      (fun x acc ->
+                        Path.State.Value.binary Symbolic.State.Or acc
+                        @@ Path.State.Value.binary Symbolic.State.Eq new_state
+                        @@ Path.State.Value.constant
+                        @@ Bitvector.of_int ~size:!ts_bitsize
+                        @@ VertexTbl.find_match v_id_tbl x)
+                      !user_errors
+                    @@ Path.State.Value.binary Symbolic.State.Eq new_state
+                         default_error_state_v
+                  in
+                  if filter_sat path predicate then (
+                    let new_state_bv =
+                      Bitvector.Map.keys @@ Path.enumerate_v path new_state
+                    in
+                    TSLogger.debug ~level:4 "Length : %d BV: %a"
+                      (List.length new_state_bv)
+                      (Format.pp_print_list Bitvector.pp)
+                      new_state_bv;
+                    let current_state_str =
+                      state_str_of_state_value path curr_state
+                    in
+                    let call_trace : string list =
+                      List.rev
+                      @@
+                      match
+                        Bitvector.Map.find_opt addr
+                        @@ Path.get path ts_call_trace_key
+                      with
+                      | Some l -> l
+                      | None -> [ name ]
+                    in
+                    TSLogger.warning
+                      "@[<v>Object %a:@ API misusage.@ Last transition:@   \
+                       [%a] -- (%s) --> [%a]@ Call trace leading to this \
+                       state:@   %a --> %s@]"
+                      Bitvector.pp_hex addr
+                      (Format.pp_print_list
+                         ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
+                         Automaton.A.Utils.pp_vertex)
+                      current_state_str name
+                      (Format.pp_print_list
+                         ~pp_sep:(fun ppf _ -> Format.fprintf ppf " | ")
+                         Automaton.A.Utils.pp_vertex)
+                      new_state_str
+                      (Format.pp_print_list
+                         ~pp_sep:(fun ppf _ -> Format.fprintf ppf " -> ")
+                         Format.pp_print_string)
+                      call_trace name;
+                    Signal Cut)
+                  else (
+                    (* update call trace for that object. *)
+                    TSLogger.debug ~level:3
+                      "%s: Updating call trace for object %a" name
+                      Bitvector.pp_hex addr;
+                    let map = Path.get path ts_call_trace_key in
+                    let lo = Bitvector.Map.find_opt addr map in
+                    Path.set path ts_call_trace_key
+                    @@ Bitvector.Map.add addr
+                         (match lo with
+                         | Some l -> name :: l
+                         | None -> [ name ])
+                         map;
+                    Return))
     in
     (* Construct *)
     let rec construct_object (l : Automaton.A.E.t list) =
@@ -864,7 +882,8 @@ struct
     let d_process = batch_process d_list in
     if d_process = Return then
       let m_process = batch_process m_list in
-      if m_process = Return then construct_object c_list else m_process
+      if m_process = Return then construct_object @@ filter_predicate c_list
+      else m_process
     else d_process
 
   (* regarder dans exec.ml ou script.ml comment c'est fait *)
@@ -1193,8 +1212,10 @@ struct
         report_error "cannot redefine bottom state."
       else if String.lowercase_ascii name = "errordefault" then
         report_error "cannot redefine default error state"
-      else if String.sub (String.lowercase_ascii name) 0 5 = "error" then
-        Automaton.A.V.create (Automaton.Error name)
+      else if
+        String.length name > 4
+        && String.sub (String.lowercase_ascii name) 0 5 = "error"
+      then Automaton.A.V.create (Automaton.Error name)
       else Automaton.A.V.create (Automaton.Ok name)
     in
     let vertex_of_string name =
@@ -1202,8 +1223,10 @@ struct
         Automaton.A.V.create Automaton.Bottom
       else if String.lowercase_ascii name = "errordefault" then
         Automaton.A.V.create Automaton.ErrorDefault
-      else if String.sub (String.lowercase_ascii name) 0 5 = "error" then
-        Automaton.A.V.create (Automaton.Error name)
+      else if
+        String.length name > 4
+        && String.sub (String.lowercase_ascii name) 0 5 = "error"
+      then Automaton.A.V.create (Automaton.Error name)
       else Automaton.A.V.create (Automaton.Ok name)
     in
     (* verteces init *)
@@ -1313,6 +1336,19 @@ struct
        la map d'objet suivi doit être vide.
     *)
     [
+      Signal_callback
+        (fun path status ->
+          match status with
+          | Error _ -> ()
+          | _ ->
+              let objects = Bitvector.Map.keys @@ Path.get path ts_state_key in
+              if List.length @@ objects <> 0 then
+                TSLogger.warning
+                  "@[<v>All object were not returned to bottom state.@ %a@]"
+                  (Format.pp_print_list Bitvector.pp_hex ~pp_sep:(fun ppf () ->
+                       Format.fprintf ppf "@ "))
+                  objects
+              else ());
       Grammar_extension grammar_extension;
       Command_handler
         (fun cmd (env : Script.env) path : bool ->
